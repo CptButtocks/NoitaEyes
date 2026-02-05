@@ -39,3 +39,73 @@ luac.out
 *.x86_64
 *.hex
 
+# Visual Studio files
+.vs/
+[Bb]in/
+[Oo]bj/
+[Dd]ebug*/
+[Rr]elease*/
+[Rr]eleases/
+[Xx]64/
+[Xx]86/
+[Aa]ny [Cc]pu/
+[Bb]uild/
+[Ll]og/
+TestResults/
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vcxproj.user
+
+# Visual Studio cache/options files
+*.VC.db
+*.VC.opendb
+*.aps
+*.pch
+*.ipch
+*.ncb
+*.opensdf
+*.sdf
+*.cachefile
+
+# Visual Studio profiler
+*.psess
+*.vsp
+*.vspx
+*.sap
+
+# Visual Studio Build Results
+*.tlog
+*.log
+
+# NuGet
+packages/
+*.nupkg
+*.snupkg
+*.nuspec
+*.lock.json
+
+# ReSharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# Rider
+.idea/
+
+# MSTest
+*.trx
+
+# Visual Studio Code (if used alongside VS)
+.vscode/
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+

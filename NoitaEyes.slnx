@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="NoitaEyes.Cli/NoitaEyes.Cli.csproj" />
+  <Project Path="NoitaEyes.Engine/NoitaEyes.Engine.csproj" />
+  <Project Path="NoitaEyes.Tests/NoitaEyes.Tests.csproj" />
+</Solution>
