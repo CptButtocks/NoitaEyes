@@ -24,4 +24,10 @@
     <ProjectReference Include="..\NoitaEyes.Engine\NoitaEyes.Engine.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="..\sources\Noita Eye Glyph Messages.md">
+      <LogicalName>sources.NoitaEyeGlyphMessages.md</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
 </Project>

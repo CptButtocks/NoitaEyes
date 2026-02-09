@@ -1,5 +1,8 @@
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using NoitaEyes.Engine;
 using Xunit;
 using Xunit.Abstractions;
@@ -32,7 +35,6 @@ public sealed class HypothesisTests
         }
 
         var expectedPass = hypothesis.Expectation == HypothesisExpectation.Pass;
-        Assert.Equal(expectedPass, result.Passed);
         if (expectedPass)
         {
             Assert.True(result.Passed, $"{hypothesis.Name}: {result.Summary}");
@@ -2630,6 +2632,840 @@ public static class HypothesisCatalog
             }
         ),
         new(
+            "Cell entropy/consensus map",
+            "Per-cell entropy highlights a fixed header scaffold with variable lead cells.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var stats = ComputeCellEntropyStats(context.Messages).ToArray();
+                var failures = new List<string>();
+
+                if (stats.Length != 411)
+                {
+                    failures.Add($"total:{stats.Length}");
+                }
+
+                var expectedCoverage = new Dictionary<int, int>
+                {
+                    [1] = 39,
+                    [2] = 12,
+                    [3] = 3,
+                    [4] = 3,
+                    [5] = 12,
+                    [6] = 33,
+                    [7] = 3,
+                    [8] = 9,
+                    [9] = 297,
+                };
+
+                var actualCoverage = stats
+                    .GroupBy(s => s.Coverage)
+                    .ToDictionary(g => g.Key, g => g.Count());
+
+                foreach (var (coverage, expectedCount) in expectedCoverage)
+                {
+                    if (!actualCoverage.TryGetValue(coverage, out var actualCount) || actualCount != expectedCount)
+                    {
+                        failures.Add($"coverage:{coverage}:{actualCount}");
+                    }
+                }
+
+                foreach (var coverage in actualCoverage.Keys.Except(expectedCoverage.Keys))
+                {
+                    failures.Add($"coverageExtra:{coverage}");
+                }
+
+                var fixedCells = stats
+                    .Where(s => s.Coverage == 9 && s.Entropy < 1e-9 && s.MaxValues.Length == 1)
+                    .ToDictionary(s => (s.Row, s.Col), s => s.MaxValues[0]);
+
+                var expectedFixed = new Dictionary<(int Row, int Col), int>
+                {
+                    [(0, 2)] = 1,
+                    [(0, 3)] = 0,
+                    [(0, 4)] = 1,
+                    [(1, 1)] = 3,
+                    [(1, 2)] = 2,
+                    [(1, 3)] = 0,
+                    [(1, 4)] = 4,
+                    [(1, 5)] = 1,
+                };
+
+                if (fixedCells.Count != expectedFixed.Count)
+                {
+                    failures.Add($"fixedCount:{fixedCells.Count}");
+                }
+
+                foreach (var (key, expectedValue) in expectedFixed)
+                {
+                    if (!fixedCells.TryGetValue(key, out var actualValue) || actualValue != expectedValue)
+                    {
+                        failures.Add($"fixed:{key.Row},{key.Col}:{actualValue}");
+                    }
+                }
+
+                var header = stats
+                    .Where(s => (s.Row == 0 || s.Row == 1) && s.Col <= 8 && s.Coverage >= 6)
+                    .ToArray();
+
+                if (header.Length != 18)
+                {
+                    failures.Add($"headerCount:{header.Length}");
+                }
+
+                var headerFixed = header.Count(s => s.Entropy < 1e-9);
+                if (headerFixed != 8)
+                {
+                    failures.Add($"headerFixed:{headerFixed}");
+                }
+
+                var headerAvg = Math.Round(header.Average(s => s.Entropy), 3);
+                if (Math.Abs(headerAvg - 0.654) > 0.0001)
+                {
+                    failures.Add($"headerAvg:{headerAvg:0.000}");
+                }
+
+                var headerHigh = header
+                    .Where(s => s.Entropy > 1.5)
+                    .Select(s => (s.Row, s.Col))
+                    .ToHashSet();
+                var expectedHigh = new HashSet<(int Row, int Col)>
+                {
+                    (0, 0),
+                    (0, 1),
+                    (1, 0),
+                };
+
+                if (headerHigh.Count != expectedHigh.Count || !headerHigh.SetEquals(expectedHigh))
+                {
+                    failures.Add($"headerHigh:{headerHigh.Count}");
+                }
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? "Cell coverage and fixed header scaffold match expected map."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["totalCells"] = stats.Length,
+                    ["coverage9"] = actualCoverage.TryGetValue(9, out var cov9) ? cov9 : 0,
+                    ["fixedCells"] = fixedCells.Count,
+                    ["headerAvgEntropy"] = headerAvg,
+                });
+            }
+        ),
+        new(
+            "Cell East/West divergence map",
+            "Per-cell value-set overlap (Jaccard) across East vs West messages with full coverage.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var east = ComputeCellValueSets(context.Messages, eastIds);
+                var west = ComputeCellValueSets(context.Messages, westIds);
+
+                var full = new List<(int Row, int Col, CellValueSet East, CellValueSet West, double Jaccard)>();
+                foreach (var (key, eastSet) in east)
+                {
+                    if (!west.TryGetValue(key, out var westSet))
+                    {
+                        continue;
+                    }
+
+                    if (eastSet.Coverage == eastIds.Count && westSet.Coverage == westIds.Count)
+                    {
+                        var jaccard = ComputeJaccard(eastSet.Values, westSet.Values).Jaccard;
+                        full.Add((key.Row, key.Col, eastSet, westSet, jaccard));
+                    }
+                }
+
+                var failures = new List<string>();
+                if (full.Count != 297)
+                {
+                    failures.Add($"full:{full.Count}");
+                }
+
+                var histogram = full
+                    .GroupBy(cell => Math.Round(cell.Jaccard, 3))
+                    .ToDictionary(g => g.Key, g => g.Count());
+
+                var expectedHistogram = new Dictionary<double, int>
+                {
+                    [0.000] = 2,
+                    [0.200] = 17,
+                    [0.250] = 31,
+                    [0.333] = 10,
+                    [0.400] = 25,
+                    [0.500] = 75,
+                    [0.600] = 14,
+                    [0.667] = 51,
+                    [0.750] = 31,
+                    [1.000] = 41,
+                };
+
+                foreach (var (key, expectedCount) in expectedHistogram)
+                {
+                    if (!histogram.TryGetValue(key, out var actualCount) || actualCount != expectedCount)
+                    {
+                        failures.Add($"hist:{key:0.000}:{actualCount}");
+                    }
+                }
+
+                foreach (var key in histogram.Keys.Except(expectedHistogram.Keys))
+                {
+                    failures.Add($"histExtra:{key:0.000}");
+                }
+
+                var zeroCells = full
+                    .Where(cell => Math.Abs(cell.Jaccard) < 1e-9)
+                    .ToDictionary(
+                        cell => (cell.Row, cell.Col),
+                        cell => (East: cell.East.Values, West: cell.West.Values));
+
+                var expectedZero = new Dictionary<(int Row, int Col), (int[] East, int[] West)>
+                {
+                    [(7, 1)] = (new[] { 2, 3 }, new[] { 1 }),
+                    [(7, 17)] = (new[] { 0, 1 }, new[] { 2, 3 }),
+                };
+
+                if (zeroCells.Count != expectedZero.Count)
+                {
+                    failures.Add($"zeroCount:{zeroCells.Count}");
+                }
+
+                foreach (var (key, expected) in expectedZero)
+                {
+                    if (!zeroCells.TryGetValue(key, out var actual))
+                    {
+                        failures.Add($"zero:{key.Row},{key.Col}:missing");
+                        continue;
+                    }
+
+                    if (!actual.East.SequenceEqual(expected.East) || !actual.West.SequenceEqual(expected.West))
+                    {
+                        failures.Add($"zero:{key.Row},{key.Col}:mismatch");
+                    }
+                }
+
+                var jaccardOne = full.Count(cell => Math.Abs(cell.Jaccard - 1.0) < 1e-9);
+                if (jaccardOne != 41)
+                {
+                    failures.Add($"jaccard1:{jaccardOne}");
+                }
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? "East/West per-cell overlap matches expected divergence profile."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["fullCoverageCells"] = full.Count,
+                    ["jaccardZero"] = zeroCells.Count,
+                    ["jaccardOne"] = jaccardOne,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 column substitution (paired)",
+            "Check if paired East/West row-pair 8 columns admit a consistent per-column substitution.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = new List<(int EastId, int WestId)>
+                {
+                    (0, 1),
+                    (2, 3),
+                    (4, 5),
+                    (6, 7),
+                };
+
+                var stats = ComputeColumnSubstitutionStats(sequences, pairs, useAlignment: false);
+                var passed = stats.PairCount == 2
+                    && stats.AlignedPositions == 52
+                    && stats.Mappings == 51
+                    && stats.Conflicts == 1;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"mappings={stats.Mappings}, conflicts={stats.Conflicts}.";
+
+                if (stats.ConflictDetails.Count != 1)
+                {
+                    passed = false;
+                }
+                else
+                {
+                    var detail = stats.ConflictDetails[0];
+                    if (detail.Index != 11
+                        || detail.EastValue != 5
+                        || !detail.WestValues.SequenceEqual(new[] { 11, 21 }))
+                    {
+                        passed = false;
+                    }
+                }
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["mappings"] = stats.Mappings,
+                    ["conflicts"] = stats.Conflicts,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 column substitution (paired, aligned)",
+            "Check if aligned row-pair 8 columns reduce East/West substitution conflicts.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = new List<(int EastId, int WestId)>
+                {
+                    (0, 1),
+                    (2, 3),
+                    (4, 5),
+                    (6, 7),
+                };
+
+                var stats = ComputeColumnSubstitutionStats(sequences, pairs, useAlignment: true);
+                var passed = stats.PairCount == 2
+                    && stats.AlignedPositions == 47
+                    && stats.Mappings == 46
+                    && stats.Conflicts == 1;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"mappings={stats.Mappings}, conflicts={stats.Conflicts}.";
+
+                if (stats.ConflictDetails.Count != 1)
+                {
+                    passed = false;
+                }
+                else
+                {
+                    var detail = stats.ConflictDetails[0];
+                    if (detail.Index != 13
+                        || detail.EastValue != 5
+                        || !detail.WestValues.SequenceEqual(new[] { 5, 11 }))
+                    {
+                        passed = false;
+                    }
+                }
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["mappings"] = stats.Mappings,
+                    ["conflicts"] = stats.Conflicts,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 column substitution (paired, stateful prev)",
+            "Check if adding previous East value resolves row-pair 8 substitution conflicts.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = new List<(int EastId, int WestId)>
+                {
+                    (0, 1),
+                    (2, 3),
+                    (4, 5),
+                    (6, 7),
+                };
+
+                var stats = ComputeColumnSubstitutionStatsWithPrev(sequences, pairs, useAlignment: false);
+                var passed = stats.PairCount == 2
+                    && stats.AlignedPositions == 52
+                    && stats.Mappings == 52
+                    && stats.Conflicts == 0;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"mappings={stats.Mappings}, conflicts={stats.Conflicts}.";
+
+                if (stats.ConflictDetails.Count != 0)
+                {
+                    passed = false;
+                }
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["mappings"] = stats.Mappings,
+                    ["conflicts"] = stats.Conflicts,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 column substitution (paired, stateful prevWest)",
+            "Check if adding previous West value resolves row-pair 8 substitution conflicts.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = new List<(int EastId, int WestId)>
+                {
+                    (0, 1),
+                    (2, 3),
+                    (4, 5),
+                    (6, 7),
+                };
+
+                var stats = ComputeColumnSubstitutionStatsWithPrevWest(sequences, pairs, useAlignment: false);
+                var passed = stats.PairCount == 2
+                    && stats.AlignedPositions == 52
+                    && stats.Mappings == 52
+                    && stats.Conflicts == 0;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"mappings={stats.Mappings}, conflicts={stats.Conflicts}.";
+
+                if (stats.ConflictDetails.Count != 0)
+                {
+                    passed = false;
+                }
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["mappings"] = stats.Mappings,
+                    ["conflicts"] = stats.Conflicts,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 column substitution (paired, stateful prevEast+prevWest)",
+            "Check if adding previous East+West values resolves row-pair 8 substitution conflicts.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = new List<(int EastId, int WestId)>
+                {
+                    (0, 1),
+                    (2, 3),
+                    (4, 5),
+                    (6, 7),
+                };
+
+                var stats = ComputeColumnSubstitutionStatsWithPrevBoth(sequences, pairs, useAlignment: false);
+                var passed = stats.PairCount == 2
+                    && stats.AlignedPositions == 52
+                    && stats.Mappings == 52
+                    && stats.Conflicts == 0;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"mappings={stats.Mappings}, conflicts={stats.Conflicts}.";
+
+                if (stats.ConflictDetails.Count != 0)
+                {
+                    passed = false;
+                }
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["mappings"] = stats.Mappings,
+                    ["conflicts"] = stats.Conflicts,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 column substitution (all pairs, stateful prevEast, aligned)",
+            "Apply stateful prevEast mapping to all East/West pairs using approximate alignment.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = ComputeColumnSubstitutionStatsWithPrev(sequences, pairs, useAlignment: true);
+                var passed = stats.PairCount == 8
+                    && stats.AlignedPositions == 147
+                    && stats.Mappings == 147
+                    && stats.Conflicts == 0;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"mappings={stats.Mappings}, conflicts={stats.Conflicts}.";
+
+                if (stats.ConflictDetails.Count != 0)
+                {
+                    passed = false;
+                }
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["mappings"] = stats.Mappings,
+                    ["conflicts"] = stats.Conflicts,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (all pairs, leave-one-out)",
+            "Predict West row-pair 8 values from East using a prevEast stateful mapping (leave-one-out).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecode(sequences, pairs, useAlignment: true);
+                var passed = stats.PairCount == 8
+                    && stats.AlignedPositions == 147
+                    && stats.CoveredPositions == 26
+                    && stats.Correct == 6;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (motif filtered, leave-one-out)",
+            "Predict West row-pair 8 values from East using prevEast mapping trained on same header motif.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                var motifs = new Dictionary<int, char>();
+                foreach (var message in context.Messages)
+                {
+                    motifs[message.Id] = GetHeaderMotifType(message);
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeByMotif(sequences, pairs, motifs, useAlignment: true);
+                var passed = stats.PairCount == 8
+                    && stats.AlignedPositions == 147
+                    && stats.CoveredPositions == 24
+                    && stats.Correct == 6;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (run position, leave-one-out)",
+            "Predict West row-pair 8 values using prevEast mapping keyed by original column index.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithRunPosition(sequences, pairs, useAlignment: true);
+                var passed = stats.PairCount == 8
+                    && stats.AlignedPositions == 147
+                    && stats.CoveredPositions == 114
+                    && stats.Correct == 24;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (run position buckets)",
+            "Bucketed accuracy for run-position decoding (index <10, <20, >=20).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithRunPositionBuckets(sequences, pairs, useAlignment: true);
+                var passed = stats.PairCount == 8
+                    && stats.AlignedPositions == 147
+                    && stats.CoveredPositions == 114
+                    && stats.Correct == 24
+                    && stats.Buckets[0].Aligned == 67
+                    && stats.Buckets[0].Covered == 54
+                    && stats.Buckets[0].Correct == 16
+                    && stats.Buckets[1].Aligned == 64
+                    && stats.Buckets[1].Covered == 58
+                    && stats.Buckets[1].Correct == 8
+                    && stats.Buckets[2].Aligned == 16
+                    && stats.Buckets[2].Covered == 2
+                    && stats.Buckets[2].Correct == 0;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}; " +
+                              $"b0={stats.Buckets[0].Covered}/{stats.Buckets[0].Aligned}/{stats.Buckets[0].Correct}, " +
+                              $"b1={stats.Buckets[1].Covered}/{stats.Buckets[1].Aligned}/{stats.Buckets[1].Correct}, " +
+                              $"b2={stats.Buckets[2].Covered}/{stats.Buckets[2].Aligned}/{stats.Buckets[2].Correct}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                    ["b0Aligned"] = stats.Buckets[0].Aligned,
+                    ["b0Covered"] = stats.Buckets[0].Covered,
+                    ["b0Correct"] = stats.Buckets[0].Correct,
+                    ["b1Aligned"] = stats.Buckets[1].Aligned,
+                    ["b1Covered"] = stats.Buckets[1].Covered,
+                    ["b1Correct"] = stats.Buckets[1].Correct,
+                    ["b2Aligned"] = stats.Buckets[2].Aligned,
+                    ["b2Covered"] = stats.Buckets[2].Covered,
+                    ["b2Correct"] = stats.Buckets[2].Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (prev2, early columns)",
+            "Second-order stateful decode limited to early columns (index < 10).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodePrev2Early(sequences, pairs, useAlignment: true, maxIndexExclusive: 10);
+                var passed = stats.PairCount == 8
+                    && stats.Aligned == 67
+                    && stats.Covered == 54
+                    && stats.Correct == 16;
+                var summary = $"pairs={stats.PairCount}, aligned={stats.Aligned}, " +
+                              $"covered={stats.Covered}, correct={stats.Correct}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.Aligned,
+                    ["covered"] = stats.Covered,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 early decode vs shuffled baseline",
+            "Compare early-column decode accuracy to a shuffled West baseline.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodePrev1EarlyWithBaseline(
+                    sequences,
+                    pairs,
+                    useAlignment: true,
+                    maxIndexExclusive: 10,
+                    samples: 200,
+                    seed: 1337);
+                var passed = stats.PairCount == 8
+                    && stats.Aligned == 67
+                    && stats.Covered == 54
+                    && stats.Correct == 16
+                    && Math.Abs(stats.BaselineMeanCorrect - 4.39) < 0.01;
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.Aligned}, " +
+                              $"covered={stats.Covered}, correct={stats.Correct}, " +
+                              $"baselineMean={stats.BaselineMeanCorrect:0.###}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.Aligned,
+                    ["covered"] = stats.Covered,
+                    ["correct"] = stats.Correct,
+                    ["baselineMean"] = stats.BaselineMeanCorrect,
+                });
+            }
+        ),
+        new(
             "Row-pair column motifs (length 3/4)",
             "Column-ordered row-pair sequences in blocks 8/10 show no shared 3- or 4-grams across messages.",
             HypothesisExpectation.Pass,
@@ -2716,6 +3552,194 @@ public static class HypothesisCatalog
                     ["row8len4"] = shared8Len4,
                     ["row10len3"] = shared10Len3,
                     ["row10len4"] = shared10Len4,
+                });
+            }
+        ),
+        new(
+            "Row-pair column motifs (length 5/6)",
+            "Column-ordered row-pair sequences in blocks 8/10 show no shared 5- or 6-grams across messages.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences8 = new Dictionary<int, int[]>();
+                var sequences10 = new Dictionary<int, int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq8 = GetRowPairColumnSequence(message, rowPair: 8);
+                    var seq10 = GetRowPairColumnSequence(message, rowPair: 10);
+                    if (seq8.Length > 0)
+                    {
+                        sequences8[message.Id] = seq8;
+                    }
+
+                    if (seq10.Length > 0)
+                    {
+                        sequences10[message.Id] = seq10;
+                    }
+                }
+
+                var shared8Len5 = CountSharedMotifs(sequences8, 5);
+                var shared8Len6 = CountSharedMotifs(sequences8, 6);
+                var shared10Len5 = CountSharedMotifs(sequences10, 5);
+                var shared10Len6 = CountSharedMotifs(sequences10, 6);
+
+                var failures = new List<string>();
+                if (shared8Len5 != 0) failures.Add($"row8len5:{shared8Len5}");
+                if (shared8Len6 != 0) failures.Add($"row8len6:{shared8Len6}");
+                if (shared10Len5 != 0) failures.Add($"row10len5:{shared10Len5}");
+                if (shared10Len6 != 0) failures.Add($"row10len6:{shared10Len6}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? "No shared 5/6-gram motifs in row-pair 8/10 column sequences."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["row8len5"] = shared8Len5,
+                    ["row8len6"] = shared8Len6,
+                    ["row10len5"] = shared10Len5,
+                    ["row10len6"] = shared10Len6,
+                });
+            }
+        ),
+        new(
+            "Row-pair column motifs (length 5/6, edit distance 1)",
+            "Column-ordered row-pair sequences in blocks 8/10 show no shared near-matches (edit distance 1) across messages.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences8 = new Dictionary<int, int[]>();
+                var sequences10 = new Dictionary<int, int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq8 = GetRowPairColumnSequence(message, rowPair: 8);
+                    var seq10 = GetRowPairColumnSequence(message, rowPair: 10);
+                    if (seq8.Length > 0)
+                    {
+                        sequences8[message.Id] = seq8;
+                    }
+
+                    if (seq10.Length > 0)
+                    {
+                        sequences10[message.Id] = seq10;
+                    }
+                }
+
+                var near8Len5 = CountNearSharedMotifs(sequences8, 5, maxDistance: 1);
+                var near8Len6 = CountNearSharedMotifs(sequences8, 6, maxDistance: 1);
+                var near10Len5 = CountNearSharedMotifs(sequences10, 5, maxDistance: 1);
+                var near10Len6 = CountNearSharedMotifs(sequences10, 6, maxDistance: 1);
+
+                var failures = new List<string>();
+                if (near8Len5 != 0) failures.Add($"row8len5:{near8Len5}");
+                if (near8Len6 != 0) failures.Add($"row8len6:{near8Len6}");
+                if (near10Len5 != 0) failures.Add($"row10len5:{near10Len5}");
+                if (near10Len6 != 0) failures.Add($"row10len6:{near10Len6}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? "No shared 5/6-gram motifs within edit distance 1 in row-pair 8/10 column sequences."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["row8len5"] = near8Len5,
+                    ["row8len6"] = near8Len6,
+                    ["row10len5"] = near10Len5,
+                    ["row10len6"] = near10Len6,
+                });
+            }
+        ),
+        new(
+            "Row-pair column motifs (coarse top/bottom digits)",
+            "Coarse-grain row-pair column values to top/bottom digits and measure shared motifs (length 3-6).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences8 = new Dictionary<int, int[]>();
+                var sequences10 = new Dictionary<int, int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq8 = GetRowPairColumnSequence(message, rowPair: 8);
+                    var seq10 = GetRowPairColumnSequence(message, rowPair: 10);
+                    if (seq8.Length > 0)
+                    {
+                        sequences8[message.Id] = seq8;
+                    }
+
+                    if (seq10.Length > 0)
+                    {
+                        sequences10[message.Id] = seq10;
+                    }
+                }
+
+                var top8 = sequences8.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v / 5).ToArray());
+                var bottom8 = sequences8.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v % 5).ToArray());
+                var top10 = sequences10.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v / 5).ToArray());
+                var bottom10 = sequences10.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v % 5).ToArray());
+
+                var top8Len3 = CountSharedMotifs(top8, 3);
+                var top8Len4 = CountSharedMotifs(top8, 4);
+                var top8Len5 = CountSharedMotifs(top8, 5);
+                var top8Len6 = CountSharedMotifs(top8, 6);
+                var bottom8Len3 = CountSharedMotifs(bottom8, 3);
+                var bottom8Len4 = CountSharedMotifs(bottom8, 4);
+                var bottom8Len5 = CountSharedMotifs(bottom8, 5);
+                var bottom8Len6 = CountSharedMotifs(bottom8, 6);
+
+                var top10Len3 = CountSharedMotifs(top10, 3);
+                var top10Len4 = CountSharedMotifs(top10, 4);
+                var top10Len5 = CountSharedMotifs(top10, 5);
+                var top10Len6 = CountSharedMotifs(top10, 6);
+                var bottom10Len3 = CountSharedMotifs(bottom10, 3);
+                var bottom10Len4 = CountSharedMotifs(bottom10, 4);
+                var bottom10Len5 = CountSharedMotifs(bottom10, 5);
+                var bottom10Len6 = CountSharedMotifs(bottom10, 6);
+
+                var passed = top8Len3 == 36
+                             && top8Len4 == 11
+                             && top8Len5 == 0
+                             && top8Len6 == 0
+                             && bottom8Len3 == 33
+                             && bottom8Len4 == 11
+                             && bottom8Len5 == 0
+                             && bottom8Len6 == 0
+                             && top10Len3 == 0
+                             && top10Len4 == 0
+                             && top10Len5 == 0
+                             && top10Len6 == 0
+                             && bottom10Len3 == 0
+                             && bottom10Len4 == 0
+                             && bottom10Len5 == 0
+                             && bottom10Len6 == 0;
+
+                var summary = $"top8(3/4/5/6)={top8Len3}/{top8Len4}/{top8Len5}/{top8Len6}, " +
+                              $"bottom8(3/4/5/6)={bottom8Len3}/{bottom8Len4}/{bottom8Len5}/{bottom8Len6}, " +
+                              $"top10(3/4/5/6)={top10Len3}/{top10Len4}/{top10Len5}/{top10Len6}, " +
+                              $"bottom10(3/4/5/6)={bottom10Len3}/{bottom10Len4}/{bottom10Len5}/{bottom10Len6}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["top8len3"] = top8Len3,
+                    ["top8len4"] = top8Len4,
+                    ["top8len5"] = top8Len5,
+                    ["top8len6"] = top8Len6,
+                    ["bottom8len3"] = bottom8Len3,
+                    ["bottom8len4"] = bottom8Len4,
+                    ["bottom8len5"] = bottom8Len5,
+                    ["bottom8len6"] = bottom8Len6,
+                    ["top10len3"] = top10Len3,
+                    ["top10len4"] = top10Len4,
+                    ["top10len5"] = top10Len5,
+                    ["top10len6"] = top10Len6,
+                    ["bottom10len3"] = bottom10Len3,
+                    ["bottom10len4"] = bottom10Len4,
+                    ["bottom10len5"] = bottom10Len5,
+                    ["bottom10len6"] = bottom10Len6,
                 });
             }
         ),
@@ -3132,6 +4156,3531 @@ public static class HypothesisCatalog
             }
         ),
         new(
+            "Row-pair 8 East/West coarse-binned overlap",
+            "Compare East vs West column bin sets after coarse frequency binning (low/med/high).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var eastSequences = new Dictionary<int, int[]>();
+                var westSequences = new Dictionary<int, int[]>();
+                var allSequences = new List<int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    allSequences.Add(seq);
+                    if (eastIds.Contains(message.Id))
+                    {
+                        eastSequences[message.Id] = seq;
+                    }
+                    else if (westIds.Contains(message.Id))
+                    {
+                        westSequences[message.Id] = seq;
+                    }
+                }
+
+                var binMap = BuildFrequencyBins(allSequences, highCount: 8, midCount: 8);
+                var binnedEast = eastSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+                var binnedWest = westSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+
+                var eastSets = ComputeColumnValueSets(binnedEast, minCoverage: 4);
+                var westSets = ComputeColumnValueSets(binnedWest, minCoverage: 2);
+
+                var rawEastSets = ComputeColumnValueSets(eastSequences, minCoverage: 4);
+                var rawWestSets = ComputeColumnValueSets(westSequences, minCoverage: 2);
+
+                var jaccards = new SortedDictionary<int, double>();
+                foreach (var col in eastSets.Keys.Intersect(westSets.Keys).OrderBy(c => c))
+                {
+                    var eastSet = eastSets[col].Values;
+                    var westSet = westSets[col].Values;
+                    var j = ComputeJaccard(eastSet, westSet).Jaccard;
+                    jaccards[col] = Math.Round(j, 3);
+                }
+
+                var rawJaccards = new List<double>();
+                foreach (var col in rawEastSets.Keys.Intersect(rawWestSets.Keys))
+                {
+                    var eastSet = rawEastSets[col].Values;
+                    var westSet = rawWestSets[col].Values;
+                    var j = ComputeJaccard(eastSet, westSet).Jaccard;
+                    rawJaccards.Add(j);
+                }
+
+                var binAvg = jaccards.Count == 0 ? 0 : Math.Round(jaccards.Values.Average(), 3);
+                var rawAvg = rawJaccards.Count == 0 ? 0 : Math.Round(rawJaccards.Average(), 3);
+
+                var low = binMap.Where(kvp => kvp.Value == 0).Select(kvp => kvp.Key).OrderBy(v => v).ToArray();
+                var mid = binMap.Where(kvp => kvp.Value == 1).Select(kvp => kvp.Key).OrderBy(v => v).ToArray();
+                var high = binMap.Where(kvp => kvp.Value == 2).Select(kvp => kvp.Key).OrderBy(v => v).ToArray();
+
+                var expectedJaccard = new Dictionary<int, double>
+                {
+                    [0] = 0.333,
+                    [1] = 0.333,
+                    [2] = 0.667,
+                    [3] = 0.0,
+                    [4] = 0.333,
+                    [5] = 0.333,
+                    [6] = 0.5,
+                    [7] = 0.5,
+                    [8] = 0.667,
+                    [9] = 1.0,
+                    [10] = 0.0,
+                    [11] = 0.5,
+                    [12] = 1.0,
+                    [13] = 0.333,
+                    [14] = 0.667,
+                };
+
+                var expectedLow = new[] { 3, 7, 9, 16, 18, 19, 20, 23, 24 };
+                var expectedMid = new[] { 8, 11, 12, 13, 15, 17, 21, 22 };
+                var expectedHigh = new[] { 0, 1, 2, 4, 5, 6, 10, 14 };
+
+                var failures = new List<string>();
+                foreach (var (col, expectedValue) in expectedJaccard)
+                {
+                    if (!jaccards.TryGetValue(col, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{col}:{observed:0.###}");
+                    }
+                }
+
+                if (Math.Abs(binAvg - 0.478) > 0.001) failures.Add($"binAvg:{binAvg:0.###}");
+                if (Math.Abs(rawAvg - 0.069) > 0.001) failures.Add($"rawAvg:{rawAvg:0.###}");
+                if (!low.SequenceEqual(expectedLow)) failures.Add("lowBins");
+                if (!mid.SequenceEqual(expectedMid)) failures.Add("midBins");
+                if (!high.SequenceEqual(expectedHigh)) failures.Add("highBins");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? "Binned overlaps match."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["binAvg"] = binAvg,
+                    ["rawAvg"] = rawAvg,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 East/West column-binned overlap",
+            "Compare East vs West column bin sets after per-column frequency binning (low/med/high).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var eastSequences = new Dictionary<int, int[]>();
+                var westSequences = new Dictionary<int, int[]>();
+                var allSequences = new List<int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    allSequences.Add(seq);
+                    if (eastIds.Contains(message.Id))
+                    {
+                        eastSequences[message.Id] = seq;
+                    }
+                    else if (westIds.Contains(message.Id))
+                    {
+                        westSequences[message.Id] = seq;
+                    }
+                }
+
+                var columnBins = BuildColumnFrequencyBins(allSequences, highCount: 2, midCount: 2);
+
+                var binnedEast = eastSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => ApplyColumnBins(kvp.Value, columnBins));
+                var binnedWest = westSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => ApplyColumnBins(kvp.Value, columnBins));
+
+                var eastSets = ComputeColumnValueSets(binnedEast, minCoverage: 4);
+                var westSets = ComputeColumnValueSets(binnedWest, minCoverage: 2);
+
+                var rawEastSets = ComputeColumnValueSets(eastSequences, minCoverage: 4);
+                var rawWestSets = ComputeColumnValueSets(westSequences, minCoverage: 2);
+
+                var jaccards = new SortedDictionary<int, double>();
+                foreach (var col in eastSets.Keys.Intersect(westSets.Keys).OrderBy(c => c))
+                {
+                    var eastSet = eastSets[col].Values;
+                    var westSet = westSets[col].Values;
+                    var j = ComputeJaccard(eastSet, westSet).Jaccard;
+                    jaccards[col] = Math.Round(j, 3);
+                }
+
+                var rawJaccards = new List<double>();
+                foreach (var col in rawEastSets.Keys.Intersect(rawWestSets.Keys))
+                {
+                    var eastSet = rawEastSets[col].Values;
+                    var westSet = rawWestSets[col].Values;
+                    var j = ComputeJaccard(eastSet, westSet).Jaccard;
+                    rawJaccards.Add(j);
+                }
+
+                var binAvg = jaccards.Count == 0 ? 0 : Math.Round(jaccards.Values.Average(), 3);
+                var rawAvg = rawJaccards.Count == 0 ? 0 : Math.Round(rawJaccards.Average(), 3);
+
+                var full = jaccards.Where(kvp => Math.Abs(kvp.Value - 1.0) < 1e-9).Select(kvp => kvp.Key).ToArray();
+                var disjoint = jaccards.Where(kvp => Math.Abs(kvp.Value) < 1e-9).Select(kvp => kvp.Key).ToArray();
+
+                var expectedJaccard = new Dictionary<int, double>
+                {
+                    [0] = 0.667,
+                    [1] = 0.0,
+                    [2] = 0.667,
+                    [3] = 0.333,
+                    [4] = 0.667,
+                    [5] = 0.5,
+                    [6] = 0.667,
+                    [7] = 0.5,
+                    [8] = 0.667,
+                    [9] = 0.0,
+                    [10] = 0.0,
+                    [11] = 0.5,
+                    [12] = 0.667,
+                    [13] = 0.667,
+                    [14] = 0.667,
+                };
+
+                var expectedDisjoint = new[] { 1, 9, 10 };
+
+                var failures = new List<string>();
+                foreach (var (col, expectedValue) in expectedJaccard)
+                {
+                    if (!jaccards.TryGetValue(col, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{col}:{observed:0.###}");
+                    }
+                }
+
+                if (Math.Abs(binAvg - 0.478) > 0.001) failures.Add($"binAvg:{binAvg:0.###}");
+                if (Math.Abs(rawAvg - 0.069) > 0.001) failures.Add($"rawAvg:{rawAvg:0.###}");
+                if (full.Length != 0) failures.Add($"full:{string.Join(",", full)}");
+                if (!disjoint.SequenceEqual(expectedDisjoint)) failures.Add("disjoint");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? "Column-binned overlaps match."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["binAvg"] = binAvg,
+                    ["rawAvg"] = rawAvg,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 East/West bin mode alignment",
+            "Compare per-column dominant bin (mode) between East and West after per-column binning.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var eastSequences = new Dictionary<int, int[]>();
+                var westSequences = new Dictionary<int, int[]>();
+                var allSequences = new List<int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    allSequences.Add(seq);
+                    if (eastIds.Contains(message.Id))
+                    {
+                        eastSequences[message.Id] = seq;
+                    }
+                    else if (westIds.Contains(message.Id))
+                    {
+                        westSequences[message.Id] = seq;
+                    }
+                }
+
+                var columnBins = BuildColumnFrequencyBins(allSequences, highCount: 2, midCount: 2);
+                var binnedEast = eastSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => ApplyColumnBins(kvp.Value, columnBins));
+                var binnedWest = westSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => ApplyColumnBins(kvp.Value, columnBins));
+
+                var eastCounts = ComputeColumnValueCounts(binnedEast);
+                var westCounts = ComputeColumnValueCounts(binnedWest);
+
+                var matched = new List<int>();
+                var mismatched = new List<int>();
+                var details = new List<string>();
+                foreach (var col in eastCounts.Keys.Intersect(westCounts.Keys).OrderBy(c => c))
+                {
+                    var eastTotal = eastCounts[col].Values.Sum();
+                    var westTotal = westCounts[col].Values.Sum();
+                    if (eastTotal < 4 || westTotal < 2)
+                    {
+                        continue;
+                    }
+
+                    var eastMode = GetModeBin(eastCounts[col]);
+                    var westMode = GetModeBin(westCounts[col]);
+                    details.Add($"{col}:{eastMode}-{westMode}");
+                    if (eastMode == westMode)
+                    {
+                        matched.Add(col);
+                    }
+                    else
+                    {
+                        mismatched.Add(col);
+                    }
+                }
+
+                var total = matched.Count + mismatched.Count;
+                var matchRate = total == 0 ? 0 : Math.Round(matched.Count / (double)total, 3);
+
+                var expectedMatched = new[] { 4, 5, 7, 11 };
+                var expectedMismatched = new[] { 0, 1, 2, 3, 6, 8, 9, 10, 12, 13, 14 };
+                var expectedModes = new Dictionary<int, (int East, int West)>
+                {
+                    [0] = (2, 1),
+                    [1] = (2, 1),
+                    [2] = (1, 2),
+                    [3] = (2, 1),
+                    [4] = (2, 2),
+                    [5] = (2, 2),
+                    [6] = (0, 2),
+                    [7] = (2, 2),
+                    [8] = (2, 1),
+                    [9] = (2, 1),
+                    [10] = (2, 0),
+                    [11] = (2, 2),
+                    [12] = (0, 2),
+                    [13] = (0, 2),
+                    [14] = (1, 2),
+                };
+
+                var failures = new List<string>();
+                if (total != 15) failures.Add($"total:{total}");
+                if (Math.Abs(matchRate - 0.267) > 0.001) failures.Add($"matchRate:{matchRate:0.###}");
+                if (!matched.SequenceEqual(expectedMatched)) failures.Add("matched");
+                if (!mismatched.SequenceEqual(expectedMismatched)) failures.Add("mismatched");
+
+                foreach (var (col, expected) in expectedModes)
+                {
+                    var observed = details.FirstOrDefault(d => d.StartsWith($"{col}:"));
+                    if (string.IsNullOrWhiteSpace(observed))
+                    {
+                        failures.Add($"{col}:missing");
+                        continue;
+                    }
+
+                    var parts = observed.Split(':', '-');
+                    if (parts.Length != 3
+                        || !int.TryParse(parts[1], out var east)
+                        || !int.TryParse(parts[2], out var west)
+                        || east != expected.East
+                        || west != expected.West)
+                    {
+                        failures.Add($"{col}:{observed}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"matches={matched.Count}/{total} ({matchRate:0.###}), " +
+                      $"matched=[{string.Join(",", matched)}], mismatched=[{string.Join(",", mismatched)}]; " +
+                      $"modes={string.Join(", ", details)}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["matchRate"] = matchRate,
+                    ["matchCount"] = matched.Count,
+                    ["total"] = total,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 East/West coarse bin sweep",
+            "Sweep coarse global bin sizes and measure East/West overlap (row-pair 8 columns 0..14).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var eastSequences = new Dictionary<int, int[]>();
+                var westSequences = new Dictionary<int, int[]>();
+                var allSequences = new List<int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    allSequences.Add(seq);
+                    if (eastIds.Contains(message.Id))
+                    {
+                        eastSequences[message.Id] = seq;
+                    }
+                    else if (westIds.Contains(message.Id))
+                    {
+                        westSequences[message.Id] = seq;
+                    }
+                }
+
+                var rawEastSets = ComputeColumnValueSets(eastSequences, minCoverage: 4);
+                var rawWestSets = ComputeColumnValueSets(westSequences, minCoverage: 2);
+                var rawJaccards = new List<double>();
+                foreach (var col in rawEastSets.Keys.Intersect(rawWestSets.Keys))
+                {
+                    rawJaccards.Add(ComputeJaccard(rawEastSets[col].Values, rawWestSets[col].Values).Jaccard);
+                }
+
+                var rawAvg = rawJaccards.Count == 0 ? 0 : Math.Round(rawJaccards.Average(), 3);
+
+                var configs = new List<(int High, int Mid)>
+                {
+                    (3, 3),
+                    (4, 4),
+                    (5, 5),
+                };
+
+                var results = new List<string>();
+                var metrics = new Dictionary<string, double>
+                {
+                    ["rawAvg"] = rawAvg,
+                };
+
+                foreach (var (high, mid) in configs)
+                {
+                    var binMap = BuildFrequencyBins(allSequences, high, mid);
+                    var binnedEast = eastSequences.ToDictionary(
+                        kvp => kvp.Key,
+                        kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+                    var binnedWest = westSequences.ToDictionary(
+                        kvp => kvp.Key,
+                        kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+
+                    var eastSets = ComputeColumnValueSets(binnedEast, minCoverage: 4);
+                    var westSets = ComputeColumnValueSets(binnedWest, minCoverage: 2);
+
+                    var jaccards = new List<double>();
+                    foreach (var col in eastSets.Keys.Intersect(westSets.Keys))
+                    {
+                        jaccards.Add(ComputeJaccard(eastSets[col].Values, westSets[col].Values).Jaccard);
+                    }
+
+                    var avg = jaccards.Count == 0 ? 0 : Math.Round(jaccards.Average(), 3);
+                    results.Add($"{high}/{mid}:{avg:0.###}");
+                    metrics[$"h{high}m{mid}"] = avg;
+                }
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["rawAvg"] = 0.069,
+                    ["h3m3"] = 0.533,
+                    ["h4m4"] = 0.456,
+                    ["h5m5"] = 0.511,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"rawAvg={rawAvg:0.###}; bins={string.Join(", ", results)}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, summary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 East/West bin top-2 alignment",
+            "Compare East/West top-2 bin sets per column after per-column binning.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var eastSequences = new Dictionary<int, int[]>();
+                var westSequences = new Dictionary<int, int[]>();
+                var allSequences = new List<int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    allSequences.Add(seq);
+                    if (eastIds.Contains(message.Id))
+                    {
+                        eastSequences[message.Id] = seq;
+                    }
+                    else if (westIds.Contains(message.Id))
+                    {
+                        westSequences[message.Id] = seq;
+                    }
+                }
+
+                var columnBins = BuildColumnFrequencyBins(allSequences, highCount: 2, midCount: 2);
+                var binnedEast = eastSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => ApplyColumnBins(kvp.Value, columnBins));
+                var binnedWest = westSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => ApplyColumnBins(kvp.Value, columnBins));
+
+                var eastCounts = ComputeColumnValueCounts(binnedEast);
+                var westCounts = ComputeColumnValueCounts(binnedWest);
+
+                var matched = new List<int>();
+                var disjoint = new List<int>();
+                var details = new List<string>();
+                var jaccards = new List<double>();
+
+                foreach (var col in eastCounts.Keys.Intersect(westCounts.Keys).OrderBy(c => c))
+                {
+                    var eastTotal = eastCounts[col].Values.Sum();
+                    var westTotal = westCounts[col].Values.Sum();
+                    if (eastTotal < 4 || westTotal < 2)
+                    {
+                        continue;
+                    }
+
+                    var eastTop = GetTopBins(eastCounts[col], 2);
+                    var westTop = GetTopBins(westCounts[col], 2);
+
+                    var inter = eastTop.Intersect(westTop).Count();
+                    var union = eastTop.Union(westTop).Count();
+                    var j = union == 0 ? 0 : Math.Round(inter / (double)union, 3);
+                    jaccards.Add(j);
+
+                    if (Math.Abs(j - 1.0) < 1e-9)
+                    {
+                        matched.Add(col);
+                    }
+                    else if (Math.Abs(j) < 1e-9)
+                    {
+                        disjoint.Add(col);
+                    }
+
+                    details.Add($"{col}:{string.Join("/", eastTop)}-{string.Join("/", westTop)}");
+                }
+
+                var avg = jaccards.Count == 0 ? 0 : Math.Round(jaccards.Average(), 3);
+                var expectedMatched = new[] { 4, 5, 7, 9, 11 };
+                var expectedDisjoint = Array.Empty<int>();
+                var expectedTop2 = new Dictionary<int, string>
+                {
+                    [0] = "2/1-1/0",
+                    [1] = "2/0-1/2",
+                    [2] = "1/2-2/0",
+                    [3] = "2/1-1/0",
+                    [4] = "2/1-2/1",
+                    [5] = "2/1-2/1",
+                    [6] = "0/2-2/1",
+                    [7] = "2/1-2/1",
+                    [8] = "2/1-1/0",
+                    [9] = "2/1-1/2",
+                    [10] = "2/1-0/2",
+                    [11] = "2/1-2/1",
+                    [12] = "0/2-2/1",
+                    [13] = "0/2-2/1",
+                    [14] = "1/2-2/0",
+                };
+
+                var failures = new List<string>();
+                if (Math.Abs(avg - 0.555) > 0.001) failures.Add($"avg:{avg:0.###}");
+                if (!matched.SequenceEqual(expectedMatched)) failures.Add("matched");
+                if (!disjoint.SequenceEqual(expectedDisjoint)) failures.Add("disjoint");
+
+                foreach (var (col, expected) in expectedTop2)
+                {
+                    var entry = details.FirstOrDefault(d => d.StartsWith($"{col}:"));
+                    if (string.IsNullOrWhiteSpace(entry) || !entry.EndsWith(expected, StringComparison.Ordinal))
+                    {
+                        failures.Add($"{col}:{entry}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"avg={avg:0.###}, matched=[{string.Join(",", matched)}], " +
+                      $"disjoint=[{string.Join(",", disjoint)}]; top2={string.Join(", ", details)}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["avg"] = avg,
+                    ["matched"] = matched.Count,
+                    ["disjoint"] = disjoint.Count,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 column entropy vs overlap",
+            "Correlate row-pair 8 column entropy with East/West overlap (raw and binned).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var allSequences = new Dictionary<int, int[]>();
+                var eastSequences = new Dictionary<int, int[]>();
+                var westSequences = new Dictionary<int, int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    allSequences[message.Id] = seq;
+                    if (eastIds.Contains(message.Id))
+                    {
+                        eastSequences[message.Id] = seq;
+                    }
+                    else if (westIds.Contains(message.Id))
+                    {
+                        westSequences[message.Id] = seq;
+                    }
+                }
+
+                var entropyStats = ComputeColumnStats(allSequences);
+                var rawEastSets = ComputeColumnValueSets(eastSequences, minCoverage: 4);
+                var rawWestSets = ComputeColumnValueSets(westSequences, minCoverage: 2);
+
+                var binMap = BuildFrequencyBins(allSequences.Values, highCount: 8, midCount: 8);
+                var binnedEast = eastSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+                var binnedWest = westSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+
+                var binnedEastSets = ComputeColumnValueSets(binnedEast, minCoverage: 4);
+                var binnedWestSets = ComputeColumnValueSets(binnedWest, minCoverage: 2);
+
+                var entropies = new List<double>();
+                var rawOverlaps = new List<double>();
+                var binnedOverlaps = new List<double>();
+
+                foreach (var col in entropyStats.Keys.OrderBy(c => c))
+                {
+                    if (!rawEastSets.TryGetValue(col, out var rawEast) || !rawWestSets.TryGetValue(col, out var rawWest))
+                    {
+                        continue;
+                    }
+
+                    if (!binnedEastSets.TryGetValue(col, out var binnedEastSet) || !binnedWestSets.TryGetValue(col, out var binnedWestSet))
+                    {
+                        continue;
+                    }
+
+                    entropies.Add(entropyStats[col].Entropy);
+                    rawOverlaps.Add(ComputeJaccard(rawEast.Values, rawWest.Values).Jaccard);
+                    binnedOverlaps.Add(ComputeJaccard(binnedEastSet.Values, binnedWestSet.Values).Jaccard);
+                }
+
+                var corrRaw = entropies.Count == 0 ? 0 : Math.Round(Correlation(entropies, rawOverlaps), 3);
+                var corrBinned = entropies.Count == 0 ? 0 : Math.Round(Correlation(entropies, binnedOverlaps), 3);
+
+                var failures = new List<string>();
+                if (Math.Abs(corrRaw - -0.833) > 0.001) failures.Add($"corrRaw:{corrRaw:0.###}");
+                if (Math.Abs(corrBinned - -0.013) > 0.001) failures.Add($"corrBinned:{corrBinned:0.###}");
+                if (entropies.Count != 15) failures.Add($"columns:{entropies.Count}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"corrRaw={corrRaw:0.###}, corrBinned={corrBinned:0.###}, columns={entropies.Count}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["corrRaw"] = corrRaw,
+                    ["corrBinned"] = corrBinned,
+                    ["columns"] = entropies.Count,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 early vs late overlap",
+            "Compare early (0-9) vs late (10-14) column overlap for raw and binned values.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var eastSequences = new Dictionary<int, int[]>();
+                var westSequences = new Dictionary<int, int[]>();
+                var allSequences = new List<int[]>();
+
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    allSequences.Add(seq);
+                    if (eastIds.Contains(message.Id))
+                    {
+                        eastSequences[message.Id] = seq;
+                    }
+                    else if (westIds.Contains(message.Id))
+                    {
+                        westSequences[message.Id] = seq;
+                    }
+                }
+
+                var rawEastSets = ComputeColumnValueSets(eastSequences, minCoverage: 4);
+                var rawWestSets = ComputeColumnValueSets(westSequences, minCoverage: 2);
+
+                var binMap = BuildFrequencyBins(allSequences, highCount: 8, midCount: 8);
+                var binnedEast = eastSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+                var binnedWest = westSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+                var binnedEastSets = ComputeColumnValueSets(binnedEast, minCoverage: 4);
+                var binnedWestSets = ComputeColumnValueSets(binnedWest, minCoverage: 2);
+
+                var earlyRaw = new List<double>();
+                var lateRaw = new List<double>();
+                var earlyBinned = new List<double>();
+                var lateBinned = new List<double>();
+
+                for (var col = 0; col <= 14; col++)
+                {
+                    if (rawEastSets.TryGetValue(col, out var rawEast) && rawWestSets.TryGetValue(col, out var rawWest))
+                    {
+                        var j = ComputeJaccard(rawEast.Values, rawWest.Values).Jaccard;
+                        if (col <= 9) earlyRaw.Add(j); else lateRaw.Add(j);
+                    }
+
+                    if (binnedEastSets.TryGetValue(col, out var binnedEastSet) && binnedWestSets.TryGetValue(col, out var binnedWestSet))
+                    {
+                        var j = ComputeJaccard(binnedEastSet.Values, binnedWestSet.Values).Jaccard;
+                        if (col <= 9) earlyBinned.Add(j); else lateBinned.Add(j);
+                    }
+                }
+
+                var earlyRawAvg = earlyRaw.Count == 0 ? 0 : Math.Round(earlyRaw.Average(), 3);
+                var lateRawAvg = lateRaw.Count == 0 ? 0 : Math.Round(lateRaw.Average(), 3);
+                var earlyBinnedAvg = earlyBinned.Count == 0 ? 0 : Math.Round(earlyBinned.Average(), 3);
+                var lateBinnedAvg = lateBinned.Count == 0 ? 0 : Math.Round(lateBinned.Average(), 3);
+
+                var failures = new List<string>();
+                if (Math.Abs(earlyRawAvg - 0.07) > 0.001) failures.Add($"rawEarly:{earlyRawAvg:0.###}");
+                if (Math.Abs(lateRawAvg - 0.067) > 0.001) failures.Add($"rawLate:{lateRawAvg:0.###}");
+                if (Math.Abs(earlyBinnedAvg - 0.467) > 0.001) failures.Add($"binEarly:{earlyBinnedAvg:0.###}");
+                if (Math.Abs(lateBinnedAvg - 0.5) > 0.001) failures.Add($"binLate:{lateBinnedAvg:0.###}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"rawEarly={earlyRawAvg:0.###}, rawLate={lateRawAvg:0.###}; " +
+                      $"binEarly={earlyBinnedAvg:0.###}, binLate={lateBinnedAvg:0.###}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["rawEarly"] = earlyRawAvg,
+                    ["rawLate"] = lateRawAvg,
+                    ["binEarly"] = earlyBinnedAvg,
+                    ["binLate"] = lateBinnedAvg,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (prev2 run position buckets)",
+            "Bucketed accuracy using prev2 state with run position key.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    sequences[message.Id] = GetRowPairColumnSequence(message, rowPair: 8);
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithRunPositionBucketsPrev2(sequences, pairs, useAlignment: true);
+                var failures = new List<string>();
+                if (stats.PairCount != 8) failures.Add($"pairs:{stats.PairCount}");
+                if (stats.AlignedPositions != 147) failures.Add($"aligned:{stats.AlignedPositions}");
+                if (stats.CoveredPositions != 114) failures.Add($"covered:{stats.CoveredPositions}");
+                if (stats.Correct != 24) failures.Add($"correct:{stats.Correct}");
+                if (stats.Buckets[0].Aligned != 67 || stats.Buckets[0].Covered != 54 || stats.Buckets[0].Correct != 16) failures.Add("b0");
+                if (stats.Buckets[1].Aligned != 64 || stats.Buckets[1].Covered != 58 || stats.Buckets[1].Correct != 8) failures.Add("b1");
+                if (stats.Buckets[2].Aligned != 16 || stats.Buckets[2].Covered != 2 || stats.Buckets[2].Correct != 0) failures.Add("b2");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, covered={stats.CoveredPositions}, " +
+                      $"correct={stats.Correct}; " +
+                      $"b0={stats.Buckets[0].Aligned}/{stats.Buckets[0].Covered}/{stats.Buckets[0].Correct}, " +
+                      $"b1={stats.Buckets[1].Aligned}/{stats.Buckets[1].Covered}/{stats.Buckets[1].Correct}, " +
+                      $"b2={stats.Buckets[2].Aligned}/{stats.Buckets[2].Covered}/{stats.Buckets[2].Correct}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (prev3 run position buckets)",
+            "Bucketed accuracy using prev3 state with run position key.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    sequences[message.Id] = GetRowPairColumnSequence(message, rowPair: 8);
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithRunPositionBucketsPrev3(sequences, pairs, useAlignment: true);
+                var failures = new List<string>();
+                if (stats.PairCount != 8) failures.Add($"pairs:{stats.PairCount}");
+                if (stats.AlignedPositions != 147) failures.Add($"aligned:{stats.AlignedPositions}");
+                if (stats.CoveredPositions != 114) failures.Add($"covered:{stats.CoveredPositions}");
+                if (stats.Correct != 24) failures.Add($"correct:{stats.Correct}");
+                if (stats.Buckets[0].Aligned != 67 || stats.Buckets[0].Covered != 54 || stats.Buckets[0].Correct != 16) failures.Add("b0");
+                if (stats.Buckets[1].Aligned != 64 || stats.Buckets[1].Covered != 58 || stats.Buckets[1].Correct != 8) failures.Add("b1");
+                if (stats.Buckets[2].Aligned != 16 || stats.Buckets[2].Covered != 2 || stats.Buckets[2].Correct != 0) failures.Add("b2");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, covered={stats.CoveredPositions}, " +
+                      $"correct={stats.Correct}; " +
+                      $"b0={stats.Buckets[0].Aligned}/{stats.Buckets[0].Covered}/{stats.Buckets[0].Correct}, " +
+                      $"b1={stats.Buckets[1].Aligned}/{stats.Buckets[1].Covered}/{stats.Buckets[1].Correct}, " +
+                      $"b2={stats.Buckets[2].Aligned}/{stats.Buckets[2].Covered}/{stats.Buckets[2].Correct}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (bucket key)",
+            "Use a bucketed index key (0-9, 10-19, 20+) with prevEast state.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    sequences[message.Id] = GetRowPairColumnSequence(message, rowPair: 8);
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithBucketKey(sequences, pairs, useAlignment: true);
+                var failures = new List<string>();
+                if (stats.PairCount != 8) failures.Add($"pairs:{stats.PairCount}");
+                if (stats.AlignedPositions != 147) failures.Add($"aligned:{stats.AlignedPositions}");
+                if (stats.CoveredPositions != 114) failures.Add($"covered:{stats.CoveredPositions}");
+                if (stats.Correct != 26) failures.Add($"correct:{stats.Correct}");
+                if (stats.Buckets[0].Aligned != 67 || stats.Buckets[0].Covered != 54 || stats.Buckets[0].Correct != 16) failures.Add("b0");
+                if (stats.Buckets[1].Aligned != 64 || stats.Buckets[1].Covered != 58 || stats.Buckets[1].Correct != 10) failures.Add("b1");
+                if (stats.Buckets[2].Aligned != 16 || stats.Buckets[2].Covered != 2 || stats.Buckets[2].Correct != 0) failures.Add("b2");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, covered={stats.CoveredPositions}, " +
+                      $"correct={stats.Correct}; " +
+                      $"b0={stats.Buckets[0].Aligned}/{stats.Buckets[0].Covered}/{stats.Buckets[0].Correct}, " +
+                      $"b1={stats.Buckets[1].Aligned}/{stats.Buckets[1].Covered}/{stats.Buckets[1].Correct}, " +
+                      $"b2={stats.Buckets[2].Aligned}/{stats.Buckets[2].Covered}/{stats.Buckets[2].Correct}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (run position constrained)",
+            "Apply column value-set constraints to prevEast run-position decoding.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    sequences[message.Id] = GetRowPairColumnSequence(message, rowPair: 8);
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithRunPositionConstrained(sequences, pairs, useAlignment: true);
+                var failures = new List<string>();
+                if (stats.PairCount != 8) failures.Add($"pairs:{stats.PairCount}");
+                if (stats.AlignedPositions != 147) failures.Add($"aligned:{stats.AlignedPositions}");
+                if (stats.CoveredPositions != 114) failures.Add($"covered:{stats.CoveredPositions}");
+                if (stats.Correct != 24) failures.Add($"correct:{stats.Correct}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                      $"covered={stats.CoveredPositions}, correct={stats.Correct}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 stateful decode (offset alignment)",
+            "Use best-offset alignment instead of Needleman–Wunsch for run-position decoding.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    sequences[message.Id] = GetRowPairColumnSequence(message, rowPair: 8);
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithRunPositionOffset(sequences, pairs, maxOffset: 5);
+                var failures = new List<string>();
+                if (stats.PairCount != 8) failures.Add($"pairs:{stats.PairCount}");
+                if (stats.AlignedPositions != 162) failures.Add($"aligned:{stats.AlignedPositions}");
+                if (stats.CoveredPositions != 144) failures.Add($"covered:{stats.CoveredPositions}");
+                if (stats.Correct != 14) failures.Add($"correct:{stats.Correct}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                      $"covered={stats.CoveredPositions}, correct={stats.Correct}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                });
+            }
+        ),
+        new(
+            "Body trigram motifs (length 2/3)",
+            "Shared trigram motifs in the body (post-header) across messages.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var bodySequences = new Dictionary<int, int[]>();
+                foreach (var (id, trigrams) in context.WeaveTrigrams)
+                {
+                    var seq = trigrams.Select(t => t.Base10Value).ToArray();
+                    if (!TryGetHeaderEndIndex(seq, out var headerEnd, out _))
+                    {
+                        continue;
+                    }
+
+                    var body = seq.Skip(headerEnd + 1).ToArray();
+                    bodySequences[id] = body;
+                }
+
+                var sharedLen2 = CountSharedMotifs(bodySequences, 2);
+                var sharedLen3 = CountSharedMotifs(bodySequences, 3);
+
+                var topLen2 = GetTopMotifCoverage(bodySequences, 2);
+                var topLen3 = GetTopMotifCoverage(bodySequences, 3);
+
+                var failures = new List<string>();
+                if (sharedLen2 != 89) failures.Add($"shared2:{sharedLen2}");
+                if (sharedLen3 != 46) failures.Add($"shared3:{sharedLen3}");
+                if (topLen2.Motif != "2-60" || topLen2.Coverage != 4) failures.Add($"top2:{topLen2.Motif}:{topLen2.Coverage}");
+                if (topLen3.Motif != "2-60-29" || topLen3.Coverage != 4) failures.Add($"top3:{topLen3.Motif}:{topLen3.Coverage}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"shared2={sharedLen2}, shared3={sharedLen3}; " +
+                      $"top2={topLen2.Motif} ({topLen2.Coverage}), " +
+                      $"top3={topLen3.Motif} ({topLen3.Coverage})."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["shared2"] = sharedLen2,
+                    ["shared3"] = sharedLen3,
+                    ["top2coverage"] = topLen2.Coverage,
+                    ["top3coverage"] = topLen3.Coverage,
+                });
+            }
+        ),
+        new(
+            "Body trigram motifs (length 2/3, edit distance 1)",
+            "Near-shared trigram motifs in the body (post-header) across messages.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var bodySequences = new Dictionary<int, int[]>();
+                foreach (var (id, trigrams) in context.WeaveTrigrams)
+                {
+                    var seq = trigrams.Select(t => t.Base10Value).ToArray();
+                    if (!TryGetHeaderEndIndex(seq, out var headerEnd, out _))
+                    {
+                        continue;
+                    }
+
+                    var body = seq.Skip(headerEnd + 1).ToArray();
+                    bodySequences[id] = body;
+                }
+
+                var nearLen2 = CountNearSharedMotifs(bodySequences, 2, maxDistance: 1);
+                var nearLen3 = CountNearSharedMotifs(bodySequences, 3, maxDistance: 1);
+
+                var failures = new List<string>();
+                if (nearLen2 != 835) failures.Add($"near2:{nearLen2}");
+                if (nearLen3 != 287) failures.Add($"near3:{nearLen3}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"near2={nearLen2}, near3={nearLen3}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["near2"] = nearLen2,
+                    ["near3"] = nearLen3,
+                });
+            }
+        ),
+        new(
+            "Body anchor segmentation (top motif)",
+            "Split body by the most common short motif and summarize segment lengths.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var bodySequences = new Dictionary<int, int[]>();
+                foreach (var (id, trigrams) in context.WeaveTrigrams)
+                {
+                    var seq = trigrams.Select(t => t.Base10Value).ToArray();
+                    if (!TryGetHeaderEndIndex(seq, out var headerEnd, out _))
+                    {
+                        continue;
+                    }
+
+                    var body = seq.Skip(headerEnd + 1).ToArray();
+                    bodySequences[id] = body;
+                }
+
+                var topLen2 = GetTopMotifCoverage(bodySequences, 2);
+                var topLen3 = GetTopMotifCoverage(bodySequences, 3);
+                var anchor = topLen3.Coverage > topLen2.Coverage ? topLen3 : topLen2;
+
+                var anchorSeq = anchor.Motif.Split('-').Select(int.Parse).ToArray();
+                var anchorsFound = 0;
+                var anchorPositions = new List<int>();
+                var preLengths = new List<int>();
+                var postLengths = new List<int>();
+
+                foreach (var body in bodySequences.Values)
+                {
+                    var idx = IndexOfSubsequence(body, anchorSeq);
+                    if (idx < 0)
+                    {
+                        continue;
+                    }
+
+                    anchorsFound++;
+                    anchorPositions.Add(idx);
+                    preLengths.Add(idx);
+                    postLengths.Add(body.Length - (idx + anchorSeq.Length));
+                }
+
+                var avgPos = anchorPositions.Count == 0 ? 0 : Math.Round(anchorPositions.Average(), 2);
+                var avgPre = preLengths.Count == 0 ? 0 : Math.Round(preLengths.Average(), 2);
+                var avgPost = postLengths.Count == 0 ? 0 : Math.Round(postLengths.Average(), 2);
+
+                var failures = new List<string>();
+                if (anchor.Motif != "2-60" || anchor.Length != 2 || anchor.Coverage != 4) failures.Add($"anchor:{anchor.Motif}:{anchor.Length}:{anchor.Coverage}");
+                if (anchorsFound != 4 || bodySequences.Count != 9) failures.Add($"found:{anchorsFound}/{bodySequences.Count}");
+                if (Math.Abs(avgPos - 0) > 0.01) failures.Add($"avgPos:{avgPos:0.##}");
+                if (Math.Abs(avgPre - 0) > 0.01) failures.Add($"avgPre:{avgPre:0.##}");
+                if (Math.Abs(avgPost - 114.5) > 0.01) failures.Add($"avgPost:{avgPost:0.##}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"anchor={anchor.Motif} (len={anchor.Length}, coverage={anchor.Coverage}); " +
+                      $"found={anchorsFound}/{bodySequences.Count}, avgPos={avgPos:0.##}, " +
+                      $"avgPre={avgPre:0.##}, avgPost={avgPost:0.##}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["anchorLen"] = anchor.Length,
+                    ["anchorCoverage"] = anchor.Coverage,
+                    ["found"] = anchorsFound,
+                    ["avgPos"] = avgPos,
+                    ["avgPre"] = avgPre,
+                    ["avgPost"] = avgPost,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 column band clustering",
+            "Cluster row-pair 8 columns by Jaccard similarity of value sets.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var columnSets = ComputeColumnValueSets(sequences, minCoverage: 2);
+                var columns = columnSets.Keys.OrderBy(c => c).ToArray();
+                var threshold = 0.5;
+                var adjacency = new Dictionary<int, HashSet<int>>();
+                foreach (var col in columns)
+                {
+                    adjacency[col] = new HashSet<int> { col };
+                }
+
+                for (var i = 0; i < columns.Length; i++)
+                {
+                    for (var j = i + 1; j < columns.Length; j++)
+                    {
+                        var a = columns[i];
+                        var b = columns[j];
+                        var jaccard = ComputeJaccard(columnSets[a].Values, columnSets[b].Values).Jaccard;
+                        if (jaccard >= threshold)
+                        {
+                            adjacency[a].Add(b);
+                            adjacency[b].Add(a);
+                        }
+                    }
+                }
+
+                var clusters = new List<List<int>>();
+                var visited = new HashSet<int>();
+                foreach (var col in columns)
+                {
+                    if (visited.Contains(col))
+                    {
+                        continue;
+                    }
+
+                    var stack = new Stack<int>();
+                    var cluster = new List<int>();
+                    stack.Push(col);
+                    visited.Add(col);
+
+                    while (stack.Count > 0)
+                    {
+                        var current = stack.Pop();
+                        cluster.Add(current);
+                        foreach (var neighbor in adjacency[current])
+                        {
+                            if (visited.Add(neighbor))
+                            {
+                                stack.Push(neighbor);
+                            }
+                        }
+                    }
+
+                    cluster.Sort();
+                    clusters.Add(cluster);
+                }
+
+                clusters = clusters.OrderByDescending(c => c.Count).ThenBy(c => c[0]).ToList();
+                var largest = clusters.FirstOrDefault() ?? new List<int>();
+
+                var failures = new List<string>();
+                if (clusters.Count != 23) failures.Add($"clusters:{clusters.Count}");
+                if (largest.Count != 3 || string.Join(",", largest) != "14,23,26") failures.Add($"largest:{string.Join(",", largest)}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"clusters={clusters.Count}, largest={largest.Count} " +
+                      $"[{string.Join(",", largest)}] (threshold={threshold:0.##})."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["clusters"] = clusters.Count,
+                    ["largest"] = largest.Count,
+                });
+            }
+        ),
+        new(
+            "HMM 2-state log-likelihood",
+            "Train a 2-state HMM on trigram sequences and compare to a unigram baseline.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = context.WeaveTrigrams
+                    .OrderBy(kvp => kvp.Key)
+                    .Select(kvp => kvp.Value.Select(t => t.Base10Value).ToArray())
+                    .ToList();
+
+                var model = TrainHmm(sequences, states: 2, symbols: 83, iterations: 5);
+                var hmmLogLik = ComputeHmmLogLikelihood(model, sequences);
+                var tokenCount = sequences.Sum(s => s.Length);
+                var hmmPerToken = Math.Round(hmmLogLik / tokenCount, 4);
+
+                var unigramLogLik = ComputeUnigramLogLikelihood(sequences, symbols: 83);
+                var unigramPerToken = Math.Round(unigramLogLik / tokenCount, 4);
+
+                var failures = new List<string>();
+                if (Math.Abs(hmmPerToken - -26.2913) > 0.001) failures.Add($"hmm:{hmmPerToken:0.####}");
+                if (Math.Abs(unigramPerToken - -4.3478) > 0.001) failures.Add($"uni:{unigramPerToken:0.####}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"hmmPerToken={hmmPerToken:0.####}, unigramPerToken={unigramPerToken:0.####}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["hmmPerToken"] = hmmPerToken,
+                    ["unigramPerToken"] = unigramPerToken,
+                });
+            }
+        ),
+        new(
+            "Top trigram path templates (length 4)",
+            "Extract top length-4 trigram paths and summarize coverage/position.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var (id, trigrams) in context.WeaveTrigrams)
+                {
+                    sequences[id] = trigrams.Select(t => t.Base10Value).ToArray();
+                }
+
+                var motifStats = new Dictionary<string, (int Count, HashSet<int> Ids, List<int> Positions)>();
+                foreach (var (id, seq) in sequences)
+                {
+                    if (seq.Length < 4)
+                    {
+                        continue;
+                    }
+
+                    for (var i = 0; i <= seq.Length - 4; i++)
+                    {
+                        var motif = string.Join("-", seq.Skip(i).Take(4));
+                        if (!motifStats.TryGetValue(motif, out var entry))
+                        {
+                            entry = (0, new HashSet<int>(), new List<int>());
+                        }
+
+                        entry.Count += 1;
+                        entry.Ids.Add(id);
+                        entry.Positions.Add(i);
+                        motifStats[motif] = entry;
+                    }
+                }
+
+                var top = motifStats
+                    .OrderByDescending(kvp => kvp.Value.Count)
+                    .ThenBy(kvp => kvp.Key)
+                    .Take(3)
+                    .ToList();
+
+                var summaries = new List<string>();
+                foreach (var (motif, stats) in top)
+                {
+                    var avgPos = stats.Positions.Count == 0 ? 0 : Math.Round(stats.Positions.Average(), 2);
+                    var coverage = stats.Ids.Count;
+                    summaries.Add($"{motif} (count={stats.Count}, coverage={coverage}, avgPos={avgPos:0.##})");
+                }
+
+                var expected = new[]
+                {
+                    "5-49-75-54 (count=6, coverage=6, avgPos=2)",
+                    "66-5-49-75 (count=6, coverage=6, avgPos=1)",
+                    "2-60-29-40 (count=4, coverage=4, avgPos=6)",
+                };
+
+                var failures = new List<string>();
+                for (var i = 0; i < expected.Length; i++)
+                {
+                    if (i >= summaries.Count || summaries[i] != expected[i])
+                    {
+                        failures.Add($"top{i}:{(i < summaries.Count ? summaries[i] : "missing")}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"top={string.Join("; ", summaries)}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["topCount"] = top.Count,
+                });
+            }
+        ),
+        new(
+            "Header lead trigram correlations",
+            "Correlate the header lead trigram with message sums, unique counts, and East/West grouping.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var leads = new List<double>();
+                var sums = new List<double>();
+                var uniques = new List<double>();
+
+                var eastLeads = new List<double>();
+                var westLeads = new List<double>();
+
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                foreach (var (id, trigrams) in context.WeaveTrigrams)
+                {
+                    if (trigrams.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var lead = trigrams[0].Base10Value;
+                    var sum = trigrams.Sum(t => t.Base10Value);
+                    var unique = trigrams.Select(t => t.Base10Value).Distinct().Count();
+
+                    leads.Add(lead);
+                    sums.Add(sum);
+                    uniques.Add(unique);
+
+                    if (eastIds.Contains(id)) eastLeads.Add(lead);
+                    if (westIds.Contains(id)) westLeads.Add(lead);
+                }
+
+                var corrSum = Math.Round(Correlation(leads, sums), 3);
+                var corrUnique = Math.Round(Correlation(leads, uniques), 3);
+                var eastMean = eastLeads.Count == 0 ? 0 : Math.Round(eastLeads.Average(), 3);
+                var westMean = westLeads.Count == 0 ? 0 : Math.Round(westLeads.Average(), 3);
+
+                var failures = new List<string>();
+                if (Math.Abs(corrSum - -0.258) > 0.001) failures.Add($"corrSum:{corrSum:0.###}");
+                if (Math.Abs(corrUnique - -0.038) > 0.001) failures.Add($"corrUnique:{corrUnique:0.###}");
+                if (Math.Abs(eastMean - 41.8) > 0.001) failures.Add($"eastMean:{eastMean:0.###}");
+                if (Math.Abs(westMean - 66.75) > 0.001) failures.Add($"westMean:{westMean:0.###}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"corrSum={corrSum:0.###}, corrUnique={corrUnique:0.###}, " +
+                      $"eastMean={eastMean:0.###}, westMean={westMean:0.###}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["corrSum"] = corrSum,
+                    ["corrUnique"] = corrUnique,
+                    ["eastMean"] = eastMean,
+                    ["westMean"] = westMean,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 length vs content",
+            "Correlate row-pair 8 length with content metrics (unique count and bin composition).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var lengths = new List<double>();
+                var uniques = new List<double>();
+                var avgBins = new List<double>();
+                var highFractions = new List<double>();
+
+                var sequences = new List<int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    sequences.Add(seq);
+                }
+
+                var binMap = BuildFrequencyBins(sequences, highCount: 8, midCount: 8);
+
+                foreach (var seq in sequences)
+                {
+                    lengths.Add(seq.Length);
+                    uniques.Add(seq.Distinct().Count());
+                    if (seq.Length == 0)
+                    {
+                        avgBins.Add(0);
+                        highFractions.Add(0);
+                        continue;
+                    }
+
+                    var bins = seq.Select(v => binMap[v]).ToArray();
+                    avgBins.Add(bins.Average());
+                    highFractions.Add(bins.Count(b => b == 2) / (double)bins.Length);
+                }
+
+                var corrUnique = Math.Round(Correlation(lengths, uniques), 3);
+                var corrAvgBin = Math.Round(Correlation(lengths, avgBins), 3);
+                var corrHigh = Math.Round(Correlation(lengths, highFractions), 3);
+
+                var failures = new List<string>();
+                if (Math.Abs(corrUnique - 0.972) > 0.001) failures.Add($"corrUnique:{corrUnique:0.###}");
+                if (Math.Abs(corrAvgBin - 0.909) > 0.001) failures.Add($"corrAvgBin:{corrAvgBin:0.###}");
+                if (Math.Abs(corrHigh - 0.92) > 0.001) failures.Add($"corrHigh:{corrHigh:0.###}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"corrUnique={corrUnique:0.###}, corrAvgBin={corrAvgBin:0.###}, corrHigh={corrHigh:0.###}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["corrUnique"] = corrUnique,
+                    ["corrAvgBin"] = corrAvgBin,
+                    ["corrHigh"] = corrHigh,
+                });
+            }
+        ),
+        new(
+            "Header lead vs motif group",
+            "Compare header lead trigram distributions between motif B and motif C groups.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var motifB = new List<double>();
+                var motifC = new List<double>();
+
+                foreach (var (id, trigrams) in context.WeaveTrigrams)
+                {
+                    var seq = trigrams.Select(t => t.Base10Value).ToArray();
+                    if (!TryGetHeaderEndIndex(seq, out _, out var motif))
+                    {
+                        continue;
+                    }
+
+                    if (seq.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    var lead = seq[0];
+                    if (motif == 'B') motifB.Add(lead);
+                    if (motif == 'C') motifC.Add(lead);
+                }
+
+                var meanB = motifB.Count == 0 ? 0 : Math.Round(motifB.Average(), 3);
+                var meanC = motifC.Count == 0 ? 0 : Math.Round(motifC.Average(), 3);
+
+                var failures = new List<string>();
+                if (Math.Abs(meanB - 51.667) > 0.001) failures.Add($"meanB:{meanB:0.###}");
+                if (Math.Abs(meanC - 55.333) > 0.001) failures.Add($"meanC:{meanC:0.###}");
+                if (motifB.Count != 6) failures.Add($"countB:{motifB.Count}");
+                if (motifC.Count != 3) failures.Add($"countC:{motifC.Count}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"meanB={meanB:0.###}, meanC={meanC:0.###}, " +
+                      $"countB={motifB.Count}, countC={motifC.Count}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["meanB"] = meanB,
+                    ["meanC"] = meanC,
+                    ["countB"] = motifB.Count,
+                    ["countC"] = motifC.Count,
+                });
+            }
+        ),
+        new(
+            "Header lead vs row-pair 8 length",
+            "Correlate lead trigram with row-pair 8 length and body length.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var leads = new List<double>();
+                var row8Lens = new List<double>();
+                var bodyLens = new List<double>();
+
+                foreach (var message in context.Messages)
+                {
+                    var trigrams = context.WeaveTrigrams[message.Id];
+                    if (trigrams.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var lead = trigrams[0].Base10Value;
+                    var row8 = GetRowPairColumnSequence(message, rowPair: 8);
+                    var bodyLen = message.Lines.Sum(l => l.Length);
+
+                    leads.Add(lead);
+                    row8Lens.Add(row8.Length);
+                    bodyLens.Add(bodyLen);
+                }
+
+                var corrRow8 = Math.Round(Correlation(leads, row8Lens), 3);
+                var corrBody = Math.Round(Correlation(leads, bodyLens), 3);
+
+                var failures = new List<string>();
+                if (Math.Abs(corrRow8 - -0.335) > 0.001) failures.Add($"corrRow8:{corrRow8:0.###}");
+                if (Math.Abs(corrBody - -0.259) > 0.001) failures.Add($"corrBody:{corrBody:0.###}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"corrRow8={corrRow8:0.###}, corrBody={corrBody:0.###}."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["corrRow8"] = corrRow8,
+                    ["corrBody"] = corrBody,
+                });
+            }
+        ),
+        new(
+            "Header lead vs payload bin composition",
+            "Compare row-pair 8 bin composition by lead trigram buckets.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new List<int[]>();
+                var leads = new List<int>();
+
+                foreach (var message in context.Messages)
+                {
+                    var trigrams = context.WeaveTrigrams[message.Id];
+                    if (trigrams.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var row8 = GetRowPairColumnSequence(message, rowPair: 8);
+                    sequences.Add(row8);
+                    leads.Add(trigrams[0].Base10Value);
+                }
+
+                var binMap = BuildFrequencyBins(sequences, highCount: 8, midCount: 8);
+                var leadOrder = leads.Select((value, index) => (value, index)).OrderBy(t => t.value).ToList();
+                var bucketSize = Math.Max(1, leadOrder.Count / 3);
+
+                var buckets = new List<List<int>>();
+                for (var i = 0; i < 3; i++)
+                {
+                    buckets.Add(new List<int>());
+                }
+
+                for (var i = 0; i < leadOrder.Count; i++)
+                {
+                    var bucket = Math.Min(2, i / bucketSize);
+                    buckets[bucket].Add(leadOrder[i].index);
+                }
+
+                var bucketStats = new List<(double AvgBin, double HighFrac)>();
+                for (var i = 0; i < 3; i++)
+                {
+                    var indices = buckets[i];
+                    var bins = new List<int>();
+                    foreach (var idx in indices)
+                    {
+                        var seq = sequences[idx];
+                        bins.AddRange(seq.Select(v => binMap[v]));
+                    }
+
+                    if (bins.Count == 0)
+                    {
+                        bucketStats.Add((0, 0));
+                    }
+                    else
+                    {
+                        bucketStats.Add((Math.Round(bins.Average(), 3), Math.Round(bins.Count(b => b == 2) / (double)bins.Count, 3)));
+                    }
+                }
+
+                var failures = new List<string>();
+                if (Math.Abs(bucketStats[0].AvgBin - 1.328) > 0.001) failures.Add($"avg0:{bucketStats[0].AvgBin:0.###}");
+                if (Math.Abs(bucketStats[1].AvgBin - 1.417) > 0.001) failures.Add($"avg1:{bucketStats[1].AvgBin:0.###}");
+                if (Math.Abs(bucketStats[2].AvgBin - 1.333) > 0.001) failures.Add($"avg2:{bucketStats[2].AvgBin:0.###}");
+                if (Math.Abs(bucketStats[0].HighFrac - 0.478) > 0.001) failures.Add($"high0:{bucketStats[0].HighFrac:0.###}");
+                if (Math.Abs(bucketStats[1].HighFrac - 0.55) > 0.001) failures.Add($"high1:{bucketStats[1].HighFrac:0.###}");
+                if (Math.Abs(bucketStats[2].HighFrac - 0.542) > 0.001) failures.Add($"high2:{bucketStats[2].HighFrac:0.###}");
+
+                var passed = failures.Count == 0;
+                var summary = failures.Count == 0
+                    ? $"bucket0(avg={bucketStats[0].AvgBin:0.###}, high={bucketStats[0].HighFrac:0.###}), " +
+                      $"bucket1(avg={bucketStats[1].AvgBin:0.###}, high={bucketStats[1].HighFrac:0.###}), " +
+                      $"bucket2(avg={bucketStats[2].AvgBin:0.###}, high={bucketStats[2].HighFrac:0.###})."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, new Dictionary<string, double>
+                {
+                    ["avg0"] = bucketStats[0].AvgBin,
+                    ["avg1"] = bucketStats[1].AvgBin,
+                    ["avg2"] = bucketStats[2].AvgBin,
+                    ["high0"] = bucketStats[0].HighFrac,
+                    ["high1"] = bucketStats[1].HighFrac,
+                    ["high2"] = bucketStats[2].HighFrac,
+                });
+            }
+        ),
+        new(
+            "Row-pair 8 length bucket overlap and entropy",
+            "Recompute overlap, entropy, and bin alignment for short/medium/long row-pair 8 length buckets.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var bucketsById = BuildLengthBuckets(sequences, bucketCount: 3);
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var summaries = new List<string>();
+                var metrics = new Dictionary<string, double>();
+
+                for (var bucket = 0; bucket < 3; bucket++)
+                {
+                    var ids = bucketsById.Where(kvp => kvp.Value == bucket).Select(kvp => kvp.Key).OrderBy(id => id).ToArray();
+                    var bucketSequences = sequences
+                        .Where(kvp => ids.Contains(kvp.Key))
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+                    var eastSequences = bucketSequences
+                        .Where(kvp => eastIds.Contains(kvp.Key))
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                    var westSequences = bucketSequences
+                        .Where(kvp => westIds.Contains(kvp.Key))
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+                    var meanLen = bucketSequences.Count == 0 ? 0 : Math.Round(bucketSequences.Values.Average(seq => seq.Length), 3);
+
+                    var entropyStats = ComputeColumnStats(bucketSequences);
+                    var entropyAvg = entropyStats.Count == 0 ? 0 : Math.Round(entropyStats.Values.Average(s => s.Entropy), 3);
+
+                    var rawOverlap = 0.0;
+                    var rawCols = 0;
+                    if (eastSequences.Count > 0 && westSequences.Count > 0)
+                    {
+                        var eastSets = ComputeColumnValueSets(eastSequences, minCoverage: 1);
+                        var westSets = ComputeColumnValueSets(westSequences, minCoverage: 1);
+                        var rawJaccards = new List<double>();
+                        foreach (var col in eastSets.Keys.Intersect(westSets.Keys))
+                        {
+                            rawJaccards.Add(ComputeJaccard(eastSets[col].Values, westSets[col].Values).Jaccard);
+                        }
+
+                        rawCols = rawJaccards.Count;
+                        rawOverlap = rawJaccards.Count == 0 ? 0 : Math.Round(rawJaccards.Average(), 3);
+                    }
+
+                    var binOverlap = 0.0;
+                    if (bucketSequences.Count > 0 && eastSequences.Count > 0 && westSequences.Count > 0)
+                    {
+                        var binMap = BuildFrequencyBins(bucketSequences.Values, highCount: 8, midCount: 8);
+                        var binnedEast = eastSequences.ToDictionary(
+                            kvp => kvp.Key,
+                            kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+                        var binnedWest = westSequences.ToDictionary(
+                            kvp => kvp.Key,
+                            kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+
+                        var eastSets = ComputeColumnValueSets(binnedEast, minCoverage: 1);
+                        var westSets = ComputeColumnValueSets(binnedWest, minCoverage: 1);
+
+                        var jaccards = new List<double>();
+                        foreach (var col in eastSets.Keys.Intersect(westSets.Keys))
+                        {
+                            jaccards.Add(ComputeJaccard(eastSets[col].Values, westSets[col].Values).Jaccard);
+                        }
+
+                        binOverlap = jaccards.Count == 0 ? 0 : Math.Round(jaccards.Average(), 3);
+                    }
+
+                    var modeMatch = 0.0;
+                    var modeCols = 0;
+                    if (bucketSequences.Count > 0 && eastSequences.Count > 0 && westSequences.Count > 0)
+                    {
+                        var columnBins = BuildColumnFrequencyBins(bucketSequences.Values, highCount: 2, midCount: 2);
+                        var binnedEast = eastSequences.ToDictionary(
+                            kvp => kvp.Key,
+                            kvp => ApplyColumnBins(kvp.Value, columnBins));
+                        var binnedWest = westSequences.ToDictionary(
+                            kvp => kvp.Key,
+                            kvp => ApplyColumnBins(kvp.Value, columnBins));
+
+                        var eastCounts = ComputeColumnValueCounts(binnedEast);
+                        var westCounts = ComputeColumnValueCounts(binnedWest);
+                        var matched = 0;
+
+                        foreach (var col in eastCounts.Keys.Intersect(westCounts.Keys))
+                        {
+                            var eastTotal = eastCounts[col].Values.Sum();
+                            var westTotal = westCounts[col].Values.Sum();
+                            if (eastTotal == 0 || westTotal == 0)
+                            {
+                                continue;
+                            }
+
+                            modeCols++;
+                            var eastMode = GetModeBin(eastCounts[col]);
+                            var westMode = GetModeBin(westCounts[col]);
+                            if (eastMode == westMode)
+                            {
+                                matched++;
+                            }
+                        }
+
+                        modeMatch = modeCols == 0 ? 0 : Math.Round(matched / (double)modeCols, 3);
+                    }
+
+                    metrics[$"b{bucket}MeanLen"] = meanLen;
+                    metrics[$"b{bucket}Entropy"] = entropyAvg;
+                    metrics[$"b{bucket}RawOverlap"] = rawOverlap;
+                    metrics[$"b{bucket}BinOverlap"] = binOverlap;
+                    metrics[$"b{bucket}ModeMatch"] = modeMatch;
+                    metrics[$"b{bucket}RawCols"] = rawCols;
+                    metrics[$"b{bucket}ModeCols"] = modeCols;
+                    metrics[$"b{bucket}Count"] = ids.Length;
+                    metrics[$"b{bucket}East"] = eastSequences.Count;
+                    metrics[$"b{bucket}West"] = westSequences.Count;
+
+                    summaries.Add(
+                        $"b{bucket}(n={ids.Length},E={eastSequences.Count},W={westSequences.Count}," +
+                        $"len={meanLen:0.###},ent={entropyAvg:0.###},raw={rawOverlap:0.###}," +
+                        $"bin={binOverlap:0.###},mode={modeMatch:0.###},cols={rawCols})");
+                }
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["b0MeanLen"] = 18,
+                    ["b1MeanLen"] = 23,
+                    ["b2MeanLen"] = 34.5,
+                    ["b0Entropy"] = 0.619,
+                    ["b1Entropy"] = 0.875,
+                    ["b2Entropy"] = 0.718,
+                    ["b0RawOverlap"] = 0,
+                    ["b1RawOverlap"] = 0.045,
+                    ["b2RawOverlap"] = 0.067,
+                    ["b0BinOverlap"] = 0,
+                    ["b1BinOverlap"] = 0.364,
+                    ["b2BinOverlap"] = 0.533,
+                    ["b0ModeMatch"] = 0,
+                    ["b1ModeMatch"] = 1,
+                    ["b2ModeMatch"] = 1,
+                    ["b0RawCols"] = 0,
+                    ["b1RawCols"] = 22,
+                    ["b2RawCols"] = 30,
+                    ["b0Count"] = 2,
+                    ["b1Count"] = 2,
+                    ["b2Count"] = 2,
+                    ["b0East"] = 2,
+                    ["b0West"] = 0,
+                    ["b1East"] = 1,
+                    ["b1West"] = 1,
+                    ["b2East"] = 1,
+                    ["b2West"] = 1,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var summary = passed
+                    ? string.Join("; ", summaries) + "."
+                    : $"Mismatches: {string.Join(", ", failures)}.";
+
+                return new HypothesisResult(passed, summary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 length bucket decoding accuracy",
+            "Evaluate run-position decoding accuracy by row-pair 8 length bucket (short/med/long).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var bucketsById = BuildLengthBuckets(sequences, bucketCount: 3);
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithRunPositionLengthBuckets(sequences, pairs, bucketsById, useAlignment: true);
+
+                var summaries = new List<string>();
+                for (var bucket = 0; bucket < stats.Buckets.Count; bucket++)
+                {
+                    var b = stats.Buckets[bucket];
+                    var acc = b.Covered == 0 ? 0 : Math.Round(b.Correct / (double)b.Covered, 3);
+                    summaries.Add($"b{bucket}={b.Covered}/{b.Aligned}/{b.Correct} (acc={acc:0.###})");
+                }
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}; " +
+                              string.Join(", ", summaries) + ".";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                for (var bucket = 0; bucket < stats.Buckets.Count; bucket++)
+                {
+                    var b = stats.Buckets[bucket];
+                    metrics[$"b{bucket}Aligned"] = b.Aligned;
+                    metrics[$"b{bucket}Covered"] = b.Covered;
+                    metrics[$"b{bucket}Correct"] = b.Correct;
+                    metrics[$"b{bucket}Acc"] = b.Covered == 0 ? 0 : Math.Round(b.Correct / (double)b.Covered, 3);
+                }
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 147,
+                    ["covered"] = 114,
+                    ["correct"] = 24,
+                    ["b0Aligned"] = 0,
+                    ["b0Covered"] = 0,
+                    ["b0Correct"] = 0,
+                    ["b0Acc"] = 0,
+                    ["b1Aligned"] = 71,
+                    ["b1Covered"] = 57,
+                    ["b1Correct"] = 12,
+                    ["b1Acc"] = 0.211,
+                    ["b2Aligned"] = 76,
+                    ["b2Covered"] = 57,
+                    ["b2Correct"] = 12,
+                    ["b2Acc"] = 0.211,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 length-normalized decoding",
+            "Use normalized position buckets for decoding and report accuracy by length bucket.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var bucketsById = BuildLengthBuckets(sequences, bucketCount: 3);
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+                var pairs = new List<(int EastId, int WestId)>();
+                foreach (var east in eastIds)
+                {
+                    foreach (var west in westIds)
+                    {
+                        pairs.Add((east, west));
+                    }
+                }
+
+                var stats = EvaluateStatefulDecodeWithNormalizedBucketByLength(sequences, pairs, bucketsById, useAlignment: true);
+
+                var summaries = new List<string>();
+                for (var bucket = 0; bucket < stats.Buckets.Count; bucket++)
+                {
+                    var b = stats.Buckets[bucket];
+                    var acc = b.Covered == 0 ? 0 : Math.Round(b.Correct / (double)b.Covered, 3);
+                    summaries.Add($"b{bucket}={b.Covered}/{b.Aligned}/{b.Correct} (acc={acc:0.###})");
+                }
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}; " +
+                              string.Join(", ", summaries) + ".";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                for (var bucket = 0; bucket < stats.Buckets.Count; bucket++)
+                {
+                    var b = stats.Buckets[bucket];
+                    metrics[$"b{bucket}Aligned"] = b.Aligned;
+                    metrics[$"b{bucket}Covered"] = b.Covered;
+                    metrics[$"b{bucket}Correct"] = b.Correct;
+                    metrics[$"b{bucket}Acc"] = b.Covered == 0 ? 0 : Math.Round(b.Correct / (double)b.Covered, 3);
+                }
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 147,
+                    ["covered"] = 115,
+                    ["correct"] = 26,
+                    ["b0Aligned"] = 0,
+                    ["b0Covered"] = 0,
+                    ["b0Correct"] = 0,
+                    ["b0Acc"] = 0,
+                    ["b1Aligned"] = 71,
+                    ["b1Covered"] = 57,
+                    ["b1Correct"] = 14,
+                    ["b1Acc"] = 0.246,
+                    ["b2Aligned"] = 76,
+                    ["b2Covered"] = 58,
+                    ["b2Correct"] = 12,
+                    ["b2Acc"] = 0.207,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 side-specific mapping consistency",
+            "Measure mapping conflicts and leave-one-out decoding accuracy within East-only and West-only subsets.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+
+                var eastPairs = BuildWithinSidePairs(eastIds, sequences);
+                var westPairs = BuildWithinSidePairs(westIds, sequences);
+
+                var eastConflicts = ComputeStatefulMappingConflicts(sequences, eastPairs, useAlignment: true);
+                var westConflicts = ComputeStatefulMappingConflicts(sequences, westPairs, useAlignment: true);
+
+                var eastStats = EvaluateStatefulDecodeWithRunPosition(sequences, eastPairs, useAlignment: true);
+                var westStats = EvaluateStatefulDecodeWithRunPosition(sequences, westPairs, useAlignment: true);
+
+                var summary = $"eastPairs={eastPairs.Count}, eastConflicts={eastConflicts.Conflicts}/{eastConflicts.Mappings}, " +
+                              $"eastCovered={eastStats.CoveredPositions}, eastCorrect={eastStats.Correct}; " +
+                              $"westPairs={westPairs.Count}, westConflicts={westConflicts.Conflicts}/{westConflicts.Mappings}, " +
+                              $"westCovered={westStats.CoveredPositions}, westCorrect={westStats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["eastPairs"] = eastPairs.Count,
+                    ["eastConflicts"] = eastConflicts.Conflicts,
+                    ["eastMappings"] = eastConflicts.Mappings,
+                    ["eastCovered"] = eastStats.CoveredPositions,
+                    ["eastCorrect"] = eastStats.Correct,
+                    ["westPairs"] = westPairs.Count,
+                    ["westConflicts"] = westConflicts.Conflicts,
+                    ["westMappings"] = westConflicts.Mappings,
+                    ["westCovered"] = westStats.CoveredPositions,
+                    ["westCorrect"] = westStats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["eastPairs"] = 12,
+                    ["eastConflicts"] = 54,
+                    ["eastMappings"] = 93,
+                    ["eastCovered"] = 158,
+                    ["eastCorrect"] = 38,
+                    ["westPairs"] = 2,
+                    ["westConflicts"] = 0,
+                    ["westMappings"] = 44,
+                    ["westCovered"] = 0,
+                    ["westCorrect"] = 0,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 cross-side transfer",
+            "Train run-position mapping within one side and evaluate on the opposite side.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new[] { 0, 2, 4, 6, 8 };
+                var westIds = new[] { 1, 3, 5, 7 };
+
+                var eastPairs = BuildWithinSidePairs(eastIds, sequences);
+                var westPairs = BuildWithinSidePairs(westIds, sequences);
+
+                var eastMapping = BuildStatefulMappingWithRunPosition(sequences, eastPairs, useAlignment: true);
+                var westMapping = BuildStatefulMappingWithRunPosition(sequences, westPairs, useAlignment: true);
+
+                var eastToWest = EvaluateStatefulDecodeWithRunPositionUsingMapping(sequences, westPairs, eastMapping, useAlignment: true);
+                var westToEast = EvaluateStatefulDecodeWithRunPositionUsingMapping(sequences, eastPairs, westMapping, useAlignment: true);
+
+                var summary = $"east->west covered={eastToWest.CoveredPositions}, correct={eastToWest.Correct}; " +
+                              $"west->east covered={westToEast.CoveredPositions}, correct={westToEast.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["eastToWestCovered"] = eastToWest.CoveredPositions,
+                    ["eastToWestCorrect"] = eastToWest.Correct,
+                    ["westToEastCovered"] = westToEast.CoveredPositions,
+                    ["westToEastCorrect"] = westToEast.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["eastToWestCovered"] = 0,
+                    ["eastToWestCorrect"] = 0,
+                    ["westToEastCovered"] = 0,
+                    ["westToEastCorrect"] = 0,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 side-conditional bins",
+            "Compute overlap using side-specific bins and apply bin constraints during decoding.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var eastSequences = sequences.Where(kvp => eastIds.Contains(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                var westSequences = sequences.Where(kvp => westIds.Contains(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+                var eastBinMap = BuildFrequencyBins(eastSequences.Values, highCount: 8, midCount: 8);
+                var westBinMap = BuildFrequencyBins(westSequences.Values, highCount: 8, midCount: 8);
+
+                var eastBinned = eastSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.Select(v => eastBinMap[v]).ToArray());
+                var westBinned = westSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => kvp.Value.Select(v => westBinMap[v]).ToArray());
+
+                var eastSets = ComputeColumnValueSets(eastBinned, minCoverage: 4);
+                var westSets = ComputeColumnValueSets(westBinned, minCoverage: 2);
+
+                var jaccards = new List<double>();
+                foreach (var col in eastSets.Keys.Intersect(westSets.Keys))
+                {
+                    jaccards.Add(ComputeJaccard(eastSets[col].Values, westSets[col].Values).Jaccard);
+                }
+
+                var sideBinAvg = jaccards.Count == 0 ? 0 : Math.Round(jaccards.Average(), 3);
+
+                var eastColumnBins = BuildColumnFrequencyBins(eastSequences.Values, highCount: 2, midCount: 2);
+                var westColumnBins = BuildColumnFrequencyBins(westSequences.Values, highCount: 2, midCount: 2);
+
+                var eastColumnBinned = eastSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => ApplyColumnBins(kvp.Value, eastColumnBins));
+                var westColumnBinned = westSequences.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => ApplyColumnBins(kvp.Value, westColumnBins));
+
+                var eastColumnSets = ComputeColumnValueSets(eastColumnBinned, minCoverage: 4);
+                var westColumnSets = ComputeColumnValueSets(westColumnBinned, minCoverage: 2);
+
+                var columnJaccards = new List<double>();
+                foreach (var col in eastColumnSets.Keys.Intersect(westColumnSets.Keys))
+                {
+                    columnJaccards.Add(ComputeJaccard(eastColumnSets[col].Values, westColumnSets[col].Values).Jaccard);
+                }
+
+                var sideColumnAvg = columnJaccards.Count == 0 ? 0 : Math.Round(columnJaccards.Average(), 3);
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var binStats = EvaluateStatefulDecodeWithRunPositionBinConstraints(sequences, pairs);
+
+                var summary = $"sideBinAvg={sideBinAvg:0.###}, sideColumnAvg={sideColumnAvg:0.###}, " +
+                              $"binCovered={binStats.CoveredPositions}, binCorrect={binStats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["sideBinAvg"] = sideBinAvg,
+                    ["sideColumnAvg"] = sideColumnAvg,
+                    ["binCovered"] = binStats.CoveredPositions,
+                    ["binCorrect"] = binStats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["sideBinAvg"] = 0.544,
+                    ["sideColumnAvg"] = 0.567,
+                    ["binCovered"] = 86,
+                    ["binCorrect"] = 19,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 paired-length bucket overlap",
+            "Recompute overlap and entropy using only paired messages that contain row-pair 8.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var pairedIds = new[] { 4, 5, 6, 7 };
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var id in pairedIds)
+                {
+                    var message = context.Messages.First(m => m.Id == id);
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[id] = seq;
+                    }
+                }
+
+                var bucketsById = BuildLengthBuckets(sequences, bucketCount: 3);
+                var eastIds = new HashSet<int> { 4, 6 };
+                var westIds = new HashSet<int> { 5, 7 };
+
+                var summaries = new List<string>();
+                var metrics = new Dictionary<string, double>();
+
+                for (var bucket = 0; bucket < 3; bucket++)
+                {
+                    var ids = bucketsById.Where(kvp => kvp.Value == bucket).Select(kvp => kvp.Key).OrderBy(id => id).ToArray();
+                    var bucketSequences = sequences
+                        .Where(kvp => ids.Contains(kvp.Key))
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+                    var eastSequences = bucketSequences
+                        .Where(kvp => eastIds.Contains(kvp.Key))
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                    var westSequences = bucketSequences
+                        .Where(kvp => westIds.Contains(kvp.Key))
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+                    var meanLen = bucketSequences.Count == 0 ? 0 : Math.Round(bucketSequences.Values.Average(seq => seq.Length), 3);
+                    var entropyStats = ComputeColumnStats(bucketSequences);
+                    var entropyAvg = entropyStats.Count == 0 ? 0 : Math.Round(entropyStats.Values.Average(s => s.Entropy), 3);
+
+                    var rawOverlap = 0.0;
+                    if (eastSequences.Count > 0 && westSequences.Count > 0)
+                    {
+                        var eastSets = ComputeColumnValueSets(eastSequences, minCoverage: 1);
+                        var westSets = ComputeColumnValueSets(westSequences, minCoverage: 1);
+                        var rawJaccards = new List<double>();
+                        foreach (var col in eastSets.Keys.Intersect(westSets.Keys))
+                        {
+                            rawJaccards.Add(ComputeJaccard(eastSets[col].Values, westSets[col].Values).Jaccard);
+                        }
+
+                        rawOverlap = rawJaccards.Count == 0 ? 0 : Math.Round(rawJaccards.Average(), 3);
+                    }
+
+                    var binOverlap = 0.0;
+                    if (bucketSequences.Count > 0 && eastSequences.Count > 0 && westSequences.Count > 0)
+                    {
+                        var binMap = BuildFrequencyBins(bucketSequences.Values, highCount: 8, midCount: 8);
+                        var binnedEast = eastSequences.ToDictionary(
+                            kvp => kvp.Key,
+                            kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+                        var binnedWest = westSequences.ToDictionary(
+                            kvp => kvp.Key,
+                            kvp => kvp.Value.Select(v => binMap[v]).ToArray());
+
+                        var eastSets = ComputeColumnValueSets(binnedEast, minCoverage: 1);
+                        var westSets = ComputeColumnValueSets(binnedWest, minCoverage: 1);
+
+                        var jaccards = new List<double>();
+                        foreach (var col in eastSets.Keys.Intersect(westSets.Keys))
+                        {
+                            jaccards.Add(ComputeJaccard(eastSets[col].Values, westSets[col].Values).Jaccard);
+                        }
+
+                        binOverlap = jaccards.Count == 0 ? 0 : Math.Round(jaccards.Average(), 3);
+                    }
+
+                    metrics[$"b{bucket}MeanLen"] = meanLen;
+                    metrics[$"b{bucket}Entropy"] = entropyAvg;
+                    metrics[$"b{bucket}RawOverlap"] = rawOverlap;
+                    metrics[$"b{bucket}BinOverlap"] = binOverlap;
+                    metrics[$"b{bucket}Count"] = ids.Length;
+
+                    summaries.Add(
+                        $"b{bucket}(n={ids.Length},len={meanLen:0.###},ent={entropyAvg:0.###}," +
+                        $"raw={rawOverlap:0.###},bin={binOverlap:0.###})");
+                }
+
+                var summary = string.Join("; ", summaries) + ".";
+                var expected = new Dictionary<string, double>
+                {
+                    ["b0MeanLen"] = 22,
+                    ["b0Entropy"] = 0,
+                    ["b0RawOverlap"] = 0,
+                    ["b0BinOverlap"] = 0,
+                    ["b0Count"] = 1,
+                    ["b1MeanLen"] = 24,
+                    ["b1Entropy"] = 0,
+                    ["b1RawOverlap"] = 0,
+                    ["b1BinOverlap"] = 0,
+                    ["b1Count"] = 1,
+                    ["b2MeanLen"] = 34.5,
+                    ["b2Entropy"] = 0.718,
+                    ["b2RawOverlap"] = 0.067,
+                    ["b2BinOverlap"] = 0.533,
+                    ["b2Count"] = 2,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 paired-length decoding accuracy",
+            "Evaluate run-position decoding accuracy using only paired messages with row-pair 8.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = new List<(int EastId, int WestId)>
+                {
+                    (4, 5),
+                    (6, 7),
+                };
+
+                var pairedSequences = sequences
+                    .Where(kvp => pairs.Select(p => p.EastId).Concat(pairs.Select(p => p.WestId)).Contains(kvp.Key))
+                    .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+                var bucketsById = BuildLengthBuckets(pairedSequences, bucketCount: 3);
+                var stats = EvaluateStatefulDecodeWithRunPositionLengthBuckets(sequences, pairs, bucketsById, useAlignment: true);
+
+                var summaries = new List<string>();
+                for (var bucket = 0; bucket < stats.Buckets.Count; bucket++)
+                {
+                    var b = stats.Buckets[bucket];
+                    var acc = b.Covered == 0 ? 0 : Math.Round(b.Correct / (double)b.Covered, 3);
+                    summaries.Add($"b{bucket}={b.Covered}/{b.Aligned}/{b.Correct} (acc={acc:0.###})");
+                }
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}; " +
+                              string.Join(", ", summaries) + ".";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                for (var bucket = 0; bucket < stats.Buckets.Count; bucket++)
+                {
+                    var b = stats.Buckets[bucket];
+                    metrics[$"b{bucket}Aligned"] = b.Aligned;
+                    metrics[$"b{bucket}Covered"] = b.Covered;
+                    metrics[$"b{bucket}Correct"] = b.Correct;
+                    metrics[$"b{bucket}Acc"] = b.Covered == 0 ? 0 : Math.Round(b.Correct / (double)b.Covered, 3);
+                }
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 2,
+                    ["aligned"] = 47,
+                    ["covered"] = 0,
+                    ["correct"] = 0,
+                    ["b0Aligned"] = 0,
+                    ["b0Covered"] = 0,
+                    ["b0Correct"] = 0,
+                    ["b0Acc"] = 0,
+                    ["b1Aligned"] = 20,
+                    ["b1Covered"] = 0,
+                    ["b1Correct"] = 0,
+                    ["b1Acc"] = 0,
+                    ["b2Aligned"] = 27,
+                    ["b2Covered"] = 0,
+                    ["b2Correct"] = 0,
+                    ["b2Acc"] = 0,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 normalized bucket sweep",
+            "Compare normalized bucket decoding for 3, 4, and 5 buckets.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var bucketsById = BuildLengthBuckets(sequences, bucketCount: 3);
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+
+                var results = new List<string>();
+                var metrics = new Dictionary<string, double>();
+
+                foreach (var bucketCount in new[] { 3, 4, 5 })
+                {
+                    var stats = EvaluateStatefulDecodeWithNormalizedBucketByLength(sequences, pairs, bucketsById, useAlignment: true, bucketCount: bucketCount);
+                    var acc = stats.CoveredPositions == 0 ? 0 : Math.Round(stats.Correct / (double)stats.CoveredPositions, 3);
+                    results.Add($"{bucketCount}b:{stats.CoveredPositions}/{stats.AlignedPositions}/{stats.Correct} (acc={acc:0.###})");
+
+                    metrics[$"b{bucketCount}Aligned"] = stats.AlignedPositions;
+                    metrics[$"b{bucketCount}Covered"] = stats.CoveredPositions;
+                    metrics[$"b{bucketCount}Correct"] = stats.Correct;
+                    metrics[$"b{bucketCount}Acc"] = acc;
+                }
+
+                var summary = string.Join("; ", results) + ".";
+                var expected = new Dictionary<string, double>
+                {
+                    ["b3Aligned"] = 147,
+                    ["b3Covered"] = 115,
+                    ["b3Correct"] = 26,
+                    ["b3Acc"] = 0.226,
+                    ["b4Aligned"] = 147,
+                    ["b4Covered"] = 115,
+                    ["b4Correct"] = 26,
+                    ["b4Acc"] = 0.226,
+                    ["b5Aligned"] = 147,
+                    ["b5Covered"] = 116,
+                    ["b5Correct"] = 26,
+                    ["b5Acc"] = 0.224,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 direct alignment decoding",
+            "Evaluate run-position decoding using direct index alignment (no gaps).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var stats = EvaluateStatefulDecodeWithRunPosition(sequences, pairs, useAlignment: false);
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 170,
+                    ["covered"] = 164,
+                    ["correct"] = 14,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 segmented alignment decoding",
+            "Align early and late segments separately before decoding.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var stats = EvaluateStatefulDecodeWithSegmentedAlignment(sequences, pairs, splitIndex: 10);
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 148,
+                    ["covered"] = 118,
+                    ["correct"] = 14,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 bin-aware alignment decoding",
+            "Align sequences using coarse bins and evaluate decoding.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var binMap = BuildFrequencyBins(sequences.Values, highCount: 8, midCount: 8);
+                var stats = EvaluateStatefulDecodeWithBinAlignment(sequences, pairs, binMap);
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 153,
+                    ["covered"] = 126,
+                    ["correct"] = 12,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 digit overlap",
+            "Compare East/West column overlap for top vs bottom digits.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+                var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+                var eastSeq = sequences.Where(kvp => eastIds.Contains(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                var westSeq = sequences.Where(kvp => westIds.Contains(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+                var eastTop = eastSeq.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v / 5).ToArray());
+                var eastBottom = eastSeq.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v % 5).ToArray());
+                var westTop = westSeq.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v / 5).ToArray());
+                var westBottom = westSeq.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v % 5).ToArray());
+
+                var topSets = ComputeColumnValueSets(eastTop, minCoverage: 4);
+                var topWest = ComputeColumnValueSets(westTop, minCoverage: 2);
+                var bottomSets = ComputeColumnValueSets(eastBottom, minCoverage: 4);
+                var bottomWest = ComputeColumnValueSets(westBottom, minCoverage: 2);
+
+                var topJ = new List<double>();
+                foreach (var col in topSets.Keys.Intersect(topWest.Keys))
+                {
+                    topJ.Add(ComputeJaccard(topSets[col].Values, topWest[col].Values).Jaccard);
+                }
+
+                var bottomJ = new List<double>();
+                foreach (var col in bottomSets.Keys.Intersect(bottomWest.Keys))
+                {
+                    bottomJ.Add(ComputeJaccard(bottomSets[col].Values, bottomWest[col].Values).Jaccard);
+                }
+
+                var topAvg = topJ.Count == 0 ? 0 : Math.Round(topJ.Average(), 3);
+                var bottomAvg = bottomJ.Count == 0 ? 0 : Math.Round(bottomJ.Average(), 3);
+
+                var summary = $"topAvg={topAvg:0.###}, bottomAvg={bottomAvg:0.###}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["topAvg"] = topAvg,
+                    ["bottomAvg"] = bottomAvg,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["topAvg"] = 0.328,
+                    ["bottomAvg"] = 0.36,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 digit-level decoding",
+            "Evaluate run-position decoding separately for top and bottom digits.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var topSequences = sequences.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v / 5).ToArray());
+                var bottomSequences = sequences.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(v => v % 5).ToArray());
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+
+                var topStats = EvaluateStatefulDecodeWithRunPosition(topSequences, pairs, useAlignment: true);
+                var bottomStats = EvaluateStatefulDecodeWithRunPosition(bottomSequences, pairs, useAlignment: true);
+
+                var summary = $"top covered={topStats.CoveredPositions}, correct={topStats.Correct}; " +
+                              $"bottom covered={bottomStats.CoveredPositions}, correct={bottomStats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["topCovered"] = topStats.CoveredPositions,
+                    ["topCorrect"] = topStats.Correct,
+                    ["bottomCovered"] = bottomStats.CoveredPositions,
+                    ["bottomCorrect"] = bottomStats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["topCovered"] = 130,
+                    ["topCorrect"] = 53,
+                    ["bottomCovered"] = 127,
+                    ["bottomCorrect"] = 69,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 hybrid constraints decoding",
+            "Apply digit + bin constraints to run-position decoding.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var stats = EvaluateStatefulDecodeWithHybridConstraints(sequences, pairs);
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 147,
+                    ["covered"] = 23,
+                    ["correct"] = 9,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 conditional digit mapping",
+            "Measure bottom|top and top|bottom digit predictability with run-position keys.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+
+                var bottomGivenTop = EvaluateConditionalDigitMapping(
+                    sequences,
+                    pairs,
+                    conditionSelector: value => value / 5,
+                    targetSelector: value => value % 5,
+                    useAlignment: true);
+
+                var topGivenBottom = EvaluateConditionalDigitMapping(
+                    sequences,
+                    pairs,
+                    conditionSelector: value => value % 5,
+                    targetSelector: value => value / 5,
+                    useAlignment: true);
+
+                var summary = $"bottom|top covered={bottomGivenTop.CoveredPositions}, correct={bottomGivenTop.Correct}; " +
+                              $"top|bottom covered={topGivenBottom.CoveredPositions}, correct={topGivenBottom.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["bottomGivenTopCovered"] = bottomGivenTop.CoveredPositions,
+                    ["bottomGivenTopCorrect"] = bottomGivenTop.Correct,
+                    ["topGivenBottomCovered"] = topGivenBottom.CoveredPositions,
+                    ["topGivenBottomCorrect"] = topGivenBottom.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["bottomGivenTopCovered"] = 98,
+                    ["bottomGivenTopCorrect"] = 53,
+                    ["topGivenBottomCovered"] = 110,
+                    ["topGivenBottomCorrect"] = 51,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"{summary} Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 two-stage digit decoding",
+            "Combine digit predictions into full values (independent and conditional variants).",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+
+                var independentStats = EvaluateTwoStageDigitDecode(
+                    sequences,
+                    pairs,
+                    useAlignment: true,
+                    mode: TwoStageDigitMode.Independent);
+
+                var topConditionalStats = EvaluateTwoStageDigitDecode(
+                    sequences,
+                    pairs,
+                    useAlignment: true,
+                    mode: TwoStageDigitMode.TopThenConditionalBottom);
+
+                var bottomConditionalStats = EvaluateTwoStageDigitDecode(
+                    sequences,
+                    pairs,
+                    useAlignment: true,
+                    mode: TwoStageDigitMode.BottomThenConditionalTop);
+
+                var summary = $"ind covered={independentStats.CoveredPositions}, correct={independentStats.Correct}; " +
+                              $"top->bottom covered={topConditionalStats.CoveredPositions}, correct={topConditionalStats.Correct}; " +
+                              $"bottom->top covered={bottomConditionalStats.CoveredPositions}, correct={bottomConditionalStats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["indCovered"] = independentStats.CoveredPositions,
+                    ["indCorrect"] = independentStats.Correct,
+                    ["topCondCovered"] = topConditionalStats.CoveredPositions,
+                    ["topCondCorrect"] = topConditionalStats.Correct,
+                    ["bottomCondCovered"] = bottomConditionalStats.CoveredPositions,
+                    ["bottomCondCorrect"] = bottomConditionalStats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["indCovered"] = 114,
+                    ["indCorrect"] = 20,
+                    ["topCondCovered"] = 116,
+                    ["topCondCorrect"] = 21,
+                    ["bottomCondCovered"] = 117,
+                    ["bottomCondCorrect"] = 27,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"{summary} Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 adaptive constraint decoding",
+            "Score candidates with bin bonuses instead of hard rejection.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var stats = EvaluateStatefulDecodeWithAdaptiveConstraints(
+                    sequences,
+                    pairs,
+                    useAlignment: true,
+                    binBonus: 1.0);
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 147,
+                    ["covered"] = 114,
+                    ["correct"] = 24,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"{summary} Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 entropy-gated bin constraints",
+            "Apply bin constraints only for low-entropy, high-overlap columns.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var stats = EvaluateStatefulDecodeWithEntropyGatedBinConstraints(
+                    sequences,
+                    pairs,
+                    useAlignment: true,
+                    entropyThreshold: 1.5,
+                    overlapThreshold: 0.2);
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 147,
+                    ["covered"] = 112,
+                    ["correct"] = 24,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"{summary} Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 early vs late decoding",
+            "Compare run-position decoding accuracy on early vs late columns.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var earlyStats = EvaluateStatefulDecodeWithRunPositionWindow(
+                    sequences,
+                    pairs,
+                    useAlignment: true,
+                    minIndexInclusive: 0,
+                    maxIndexExclusive: 10);
+                var lateStats = EvaluateStatefulDecodeWithRunPositionWindow(
+                    sequences,
+                    pairs,
+                    useAlignment: true,
+                    minIndexInclusive: 10,
+                    maxIndexExclusive: null);
+
+                var summary = $"early covered={earlyStats.CoveredPositions}, correct={earlyStats.Correct}; " +
+                              $"late covered={lateStats.CoveredPositions}, correct={lateStats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["earlyCovered"] = earlyStats.CoveredPositions,
+                    ["earlyCorrect"] = earlyStats.Correct,
+                    ["lateCovered"] = lateStats.CoveredPositions,
+                    ["lateCorrect"] = lateStats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["earlyCovered"] = 54,
+                    ["earlyCorrect"] = 16,
+                    ["lateCovered"] = 60,
+                    ["lateCorrect"] = 8,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"{summary} Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Row-pair 8 rhythm-anchored alignment",
+            "Align row-pair 8 sequences using body rhythm anchor offsets.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var message in context.Messages)
+                {
+                    var seq = GetRowPairColumnSequence(message, rowPair: 8);
+                    if (seq.Length > 0)
+                    {
+                        sequences[message.Id] = seq;
+                    }
+                }
+
+                var anchorStarts = new Dictionary<int, int>();
+                foreach (var message in context.Messages)
+                {
+                    if (TryGetRowPairRunStartIndex(message, rowPair: 8, out var startIndex))
+                    {
+                        anchorStarts[message.Id] = startIndex;
+                    }
+                }
+
+                var pairs = BuildCrossSidePairs(new[] { 0, 2, 4, 6, 8 }, new[] { 1, 3, 5, 7 });
+                var stats = EvaluateStatefulDecodeWithAnchorOffsets(sequences, pairs, anchorStarts);
+
+                var summary = $"pairs={stats.PairCount}, aligned={stats.AlignedPositions}, " +
+                              $"covered={stats.CoveredPositions}, correct={stats.Correct}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["pairs"] = stats.PairCount,
+                    ["aligned"] = stats.AlignedPositions,
+                    ["covered"] = stats.CoveredPositions,
+                    ["correct"] = stats.Correct,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["pairs"] = 8,
+                    ["aligned"] = 170,
+                    ["covered"] = 164,
+                    ["correct"] = 14,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"{summary} Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "HMM 3-state log-likelihood (header/body init)",
+            "Train a 3-state HMM with header/body initialization.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = context.WeaveTrigrams
+                    .OrderBy(kvp => kvp.Key)
+                    .Select(kvp => kvp.Value.Select(t => t.Base10Value).ToArray())
+                    .ToList();
+
+                var model = TrainHmmWithHeaderBodyInit(sequences, states: 3, symbols: 83, iterations: 5);
+                var hmmLogLik = ComputeHmmLogLikelihood(model, sequences);
+                var tokenCount = sequences.Sum(s => s.Length);
+                var hmmPerToken = Math.Round(hmmLogLik / tokenCount, 4);
+
+                var unigramLogLik = ComputeUnigramLogLikelihood(sequences, symbols: 83);
+                var unigramPerToken = Math.Round(unigramLogLik / tokenCount, 4);
+
+                var summary = $"hmmPerToken={hmmPerToken:0.####}, unigramPerToken={unigramPerToken:0.####}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["hmmPerToken"] = hmmPerToken,
+                    ["unigramPerToken"] = unigramPerToken,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["hmmPerToken"] = -25.9105,
+                    ["unigramPerToken"] = -4.3478,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.####}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "HMM 4-state log-likelihood (header/body init)",
+            "Train a 4-state HMM with header/body initialization.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = context.WeaveTrigrams
+                    .OrderBy(kvp => kvp.Key)
+                    .Select(kvp => kvp.Value.Select(t => t.Base10Value).ToArray())
+                    .ToList();
+
+                var model = TrainHmmWithHeaderBodyInit(sequences, states: 4, symbols: 83, iterations: 5);
+                var hmmLogLik = ComputeHmmLogLikelihood(model, sequences);
+                var tokenCount = sequences.Sum(s => s.Length);
+                var hmmPerToken = Math.Round(hmmLogLik / tokenCount, 4);
+
+                var unigramLogLik = ComputeUnigramLogLikelihood(sequences, symbols: 83);
+                var unigramPerToken = Math.Round(unigramLogLik / tokenCount, 4);
+
+                var summary = $"hmmPerToken={hmmPerToken:0.####}, unigramPerToken={unigramPerToken:0.####}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["hmmPerToken"] = hmmPerToken,
+                    ["unigramPerToken"] = unigramPerToken,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["hmmPerToken"] = -25.9335,
+                    ["unigramPerToken"] = -4.3478,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.####}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Top body trigram path templates (length 4)",
+            "Extract top length-4 trigram paths restricted to body indices.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = new Dictionary<int, int[]>();
+                foreach (var (id, trigrams) in context.WeaveTrigrams)
+                {
+                    var seq = trigrams.Select(t => t.Base10Value).ToArray();
+                    if (!TryGetHeaderEndIndex(seq, out var headerEndIndex, out _))
+                    {
+                        continue;
+                    }
+
+                    var body = seq.Skip(headerEndIndex + 1).ToArray();
+                    sequences[id] = body;
+                }
+
+                var motifStats = new Dictionary<string, (int Count, HashSet<int> Ids, List<int> Positions)>();
+                foreach (var (id, seq) in sequences)
+                {
+                    if (seq.Length < 4)
+                    {
+                        continue;
+                    }
+
+                    for (var i = 0; i <= seq.Length - 4; i++)
+                    {
+                        var motif = string.Join("-", seq.Skip(i).Take(4));
+                        if (!motifStats.TryGetValue(motif, out var entry))
+                        {
+                            entry = (0, new HashSet<int>(), new List<int>());
+                        }
+
+                        entry.Count += 1;
+                        entry.Ids.Add(id);
+                        entry.Positions.Add(i);
+                        motifStats[motif] = entry;
+                    }
+                }
+
+                var top = motifStats
+                    .OrderByDescending(kvp => kvp.Value.Count)
+                    .ThenBy(kvp => kvp.Key)
+                    .Take(3)
+                    .ToList();
+
+                var summaries = new List<string>();
+                foreach (var (motif, stats) in top)
+                {
+                    var avgPos = stats.Positions.Count == 0 ? 0 : Math.Round(stats.Positions.Average(), 2);
+                    summaries.Add($"{motif} (count={stats.Count}, coverage={stats.Ids.Count}, avgPos={avgPos:0.##})");
+                }
+
+                var summary = $"top={string.Join("; ", summaries)}.";
+                var metrics = new Dictionary<string, double>
+                {
+                    ["topCount"] = top.Count,
+                };
+
+                var expected = new[]
+                {
+                    "2-60-29-40 (count=4, coverage=4, avgPos=0)",
+                    "14-81-8-15 (count=3, coverage=3, avgPos=9)",
+                    "15-59-18-68 (count=3, coverage=3, avgPos=7)",
+                };
+
+                var failures = new List<string>();
+                for (var i = 0; i < expected.Length; i++)
+                {
+                    if (i >= summaries.Count || summaries[i] != expected[i])
+                    {
+                        failures.Add($"top{i}:{(i < summaries.Count ? summaries[i] : "missing")}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
+            "Shared order-2 grammar contexts",
+            "Identify order-2 contexts shared across messages and evaluate their predictive power.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var sequences = context.WeaveTrigrams
+                    .OrderBy(kvp => kvp.Key)
+                    .ToDictionary(
+                        kvp => kvp.Key,
+                        kvp => kvp.Value.Select(t => t.Base10Value).ToArray());
+
+                var sharedContexts = BuildSharedOrder2Contexts(sequences, minMessageCoverage: 3);
+                var coverageStats = ComputeSharedContextCoverage(sequences, sharedContexts);
+                var predictionStats = EvaluateSharedContextPrediction(sequences, sharedContexts);
+                var enrichment = ComputeSharedContextEnrichment(sequences, sharedContexts);
+
+                var summary = $"contexts={sharedContexts.Count}, coverage={coverageStats.CoverageRate:0.###}, " +
+                              $"pred={predictionStats.Correct}/{predictionStats.Covered}, " +
+                              $"headerShare={enrichment.SharedHeaderShare:0.###}, baseline={enrichment.BaselineHeaderShare:0.###}, " +
+                              $"ratio={enrichment.EnrichmentRatio:0.###}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["contexts"] = sharedContexts.Count,
+                    ["coverage"] = coverageStats.CoverageRate,
+                    ["predCovered"] = predictionStats.Covered,
+                    ["predCorrect"] = predictionStats.Correct,
+                    ["sharedHeaderShare"] = enrichment.SharedHeaderShare,
+                    ["baselineHeaderShare"] = enrichment.BaselineHeaderShare,
+                    ["enrichmentRatio"] = enrichment.EnrichmentRatio,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["contexts"] = 47,
+                    ["coverage"] = 0.162,
+                    ["predCovered"] = 165,
+                    ["predCorrect"] = 132,
+                    ["sharedHeaderShare"] = 0.164,
+                    ["baselineHeaderShare"] = 0.035,
+                    ["enrichmentRatio"] = 4.686,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0;
+                var finalSummary = passed ? summary : $"{summary} Mismatches: {string.Join(", ", failures)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
+            }
+        ),
+        new(
             "No adjacent trigram repeats",
             "No trigram value appears twice in a row within a message.",
             HypothesisExpectation.Pass,
@@ -3173,6 +7722,77 @@ public static class HypothesisCatalog
                     ? "All starting trigrams > 26."
                     : $"Failures: {string.Join(", ", failures)}.";
                 return new HypothesisResult(passed, summary);
+            }
+        ),
+        new(
+            "Source glyph messages match engine data",
+            "Validate that the source glyph message file matches the engine messages.",
+            HypothesisExpectation.Pass,
+            context =>
+            {
+                var source = LoadSourceGlyphMessages();
+                var mismatches = new List<string>();
+
+                foreach (var message in context.Messages)
+                {
+                    if (!source.TryGetValue(message.Id, out var lines))
+                    {
+                        mismatches.Add($"{message.Id}:missing");
+                        continue;
+                    }
+
+                    var engineLines = message.Lines.Select(l => new string(l.Where(char.IsDigit).ToArray())).ToArray();
+                    if (engineLines.Length != lines.Length)
+                    {
+                        mismatches.Add($"{message.Id}:len {engineLines.Length}!={lines.Length}");
+                        continue;
+                    }
+
+                    for (var i = 0; i < engineLines.Length; i++)
+                    {
+                        if (engineLines[i] != lines[i])
+                        {
+                            mismatches.Add($"{message.Id}:line{i}");
+                            break;
+                        }
+                    }
+                }
+
+                foreach (var id in source.Keys.Except(context.Messages.Select(m => m.Id)))
+                {
+                    mismatches.Add($"{id}:extra");
+                }
+
+                var summary = mismatches.Count == 0
+                    ? $"sourceCount={source.Count}, engineCount={context.Messages.Count}, mismatches=0."
+                    : $"sourceCount={source.Count}, engineCount={context.Messages.Count}, mismatches={mismatches.Count}.";
+
+                var metrics = new Dictionary<string, double>
+                {
+                    ["sourceCount"] = source.Count,
+                    ["engineCount"] = context.Messages.Count,
+                    ["mismatchCount"] = mismatches.Count,
+                };
+
+                var expected = new Dictionary<string, double>
+                {
+                    ["sourceCount"] = 9,
+                    ["engineCount"] = 9,
+                    ["mismatchCount"] = 0,
+                };
+
+                var failures = new List<string>();
+                foreach (var (key, expectedValue) in expected)
+                {
+                    if (!metrics.TryGetValue(key, out var observed) || Math.Abs(observed - expectedValue) > 0.001)
+                    {
+                        failures.Add($"{key}:{observed:0.###}");
+                    }
+                }
+
+                var passed = failures.Count == 0 && mismatches.Count == 0;
+                var finalSummary = passed ? summary : $"{summary} Mismatches: {string.Join(", ", mismatches)}.";
+                return new HypothesisResult(passed, finalSummary, metrics);
             }
         ),
         new(
@@ -3350,6 +7970,100 @@ public static class HypothesisCatalog
     private sealed record ColumnStat(int Count, int Unique, double Entropy, double MaxProb);
 
     private sealed record ColumnValueSet(int Count, int[] Values);
+
+    private sealed record MotifCoverage(string Motif, int Coverage, int Length);
+
+    private sealed record HmmModel(double[] Pi, double[,] A, double[,] B);
+
+    private sealed record CellEntropyStat(
+        int Row,
+        int Col,
+        int Coverage,
+        double Entropy,
+        double MaxProb,
+        int[] MaxValues);
+
+    private sealed record CellValueSet(
+        int Coverage,
+        int[] Values);
+
+    private sealed record ColumnSubstitutionConflict(int Index, int EastValue, int[] WestValues);
+
+    private sealed record ColumnSubstitutionStats(
+        int Conflicts,
+        int Mappings,
+        int PairCount,
+        int AlignedPositions,
+        IReadOnlyList<ColumnSubstitutionConflict> ConflictDetails);
+
+    private sealed record ColumnSubstitutionConflictWithPrev(int Index, int EastValue, int? PrevEastValue, int[] WestValues);
+
+    private sealed record ColumnSubstitutionStatsWithPrev(
+        int Conflicts,
+        int Mappings,
+        int PairCount,
+        int AlignedPositions,
+        IReadOnlyList<ColumnSubstitutionConflictWithPrev> ConflictDetails);
+
+    private sealed record ColumnSubstitutionConflictWithPrevWest(int Index, int EastValue, int? PrevWestValue, int[] WestValues);
+
+    private sealed record ColumnSubstitutionStatsWithPrevWest(
+        int Conflicts,
+        int Mappings,
+        int PairCount,
+        int AlignedPositions,
+        IReadOnlyList<ColumnSubstitutionConflictWithPrevWest> ConflictDetails);
+
+    private sealed record ColumnSubstitutionConflictWithPrevBoth(
+        int Index,
+        int EastValue,
+        int? PrevEastValue,
+        int? PrevWestValue,
+        int[] WestValues);
+
+    private sealed record ColumnSubstitutionStatsWithPrevBoth(
+        int Conflicts,
+        int Mappings,
+        int PairCount,
+        int AlignedPositions,
+        IReadOnlyList<ColumnSubstitutionConflictWithPrevBoth> ConflictDetails);
+
+    private sealed record StatefulDecodeStats(
+        int PairCount,
+        int AlignedPositions,
+        int CoveredPositions,
+        int Correct);
+
+    private sealed record BucketDecodeStats(int Aligned, int Covered, int Correct);
+
+    private sealed record BucketedDecodeStats(
+        int PairCount,
+        int AlignedPositions,
+        int CoveredPositions,
+        int Correct,
+        IReadOnlyList<BucketDecodeStats> Buckets);
+
+    private sealed record EarlyDecodeStats(int PairCount, int Aligned, int Covered, int Correct);
+
+    private sealed record EarlyDecodeBaselineStats(
+        int PairCount,
+        int Aligned,
+        int Covered,
+        int Correct,
+        double BaselineMeanCorrect);
+
+    private sealed record SharedContextCoverageStats(double CoverageRate, int SharedPositions, int TotalPositions);
+
+    private sealed record SharedContextPredictionStats(int Covered, int Correct);
+
+    private sealed record SharedContextEnrichmentStats(double SharedHeaderShare, double BaselineHeaderShare, double EnrichmentRatio);
+
+    private enum TwoStageDigitMode
+    {
+        Independent,
+        TopThenConditionalBottom,
+        BottomThenConditionalTop
+    }
 
     private static BodyMetrics GetBodyMetrics(EyeMessage message)
     {
@@ -3584,6 +8298,295 @@ public static class HypothesisCatalog
         return motifToIds.Count(kvp => kvp.Value.Count >= 2);
     }
 
+    private static Dictionary<int, int> BuildLengthBuckets(Dictionary<int, int[]> sequences, int bucketCount)
+    {
+        var ordered = sequences
+            .Select(kvp => (Id: kvp.Key, Length: kvp.Value.Length))
+            .OrderBy(item => item.Length)
+            .ThenBy(item => item.Id)
+            .ToList();
+
+        var bucketSize = Math.Max(1, ordered.Count / bucketCount);
+        var buckets = new Dictionary<int, int>();
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            var bucket = Math.Min(bucketCount - 1, i / bucketSize);
+            buckets[ordered[i].Id] = bucket;
+        }
+
+        return buckets;
+    }
+
+    private static int GetNormalizedBucket(int index, int length, int bucketCount)
+    {
+        if (bucketCount <= 1 || length <= 1)
+        {
+            return 0;
+        }
+
+        var ratio = index / (double)(length - 1);
+        var bucket = (int)Math.Floor(ratio * bucketCount);
+        if (bucket < 0)
+        {
+            return 0;
+        }
+
+        return bucket >= bucketCount ? bucketCount - 1 : bucket;
+    }
+
+    private static Dictionary<int, int> BuildFrequencyBins(IEnumerable<int[]> sequences, int highCount, int midCount)
+    {
+        var counts = Enumerable.Range(0, 25).ToDictionary(v => v, _ => 0);
+        foreach (var sequence in sequences)
+        {
+            foreach (var value in sequence)
+            {
+                counts[value]++;
+            }
+        }
+
+        var ordered = counts
+            .OrderByDescending(kvp => kvp.Value)
+            .ThenBy(kvp => kvp.Key)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+        var bins = new Dictionary<int, int>();
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            var value = ordered[i];
+            bins[value] = i < highCount ? 2
+                : i < highCount + midCount ? 1
+                : 0;
+        }
+
+        return bins;
+    }
+
+    private static Dictionary<int, Dictionary<int, int>> BuildColumnFrequencyBins(
+        IEnumerable<int[]> sequences,
+        int highCount,
+        int midCount)
+    {
+        var countsByColumn = new Dictionary<int, Dictionary<int, int>>();
+        foreach (var sequence in sequences)
+        {
+            for (var i = 0; i < sequence.Length; i++)
+            {
+                if (!countsByColumn.TryGetValue(i, out var counts))
+                {
+                    counts = new Dictionary<int, int>();
+                    countsByColumn[i] = counts;
+                }
+
+                var value = sequence[i];
+                counts[value] = counts.TryGetValue(value, out var count) ? count + 1 : 1;
+            }
+        }
+
+        var binsByColumn = new Dictionary<int, Dictionary<int, int>>();
+        foreach (var (col, counts) in countsByColumn)
+        {
+            var ordered = counts
+                .OrderByDescending(kvp => kvp.Value)
+                .ThenBy(kvp => kvp.Key)
+                .Select(kvp => kvp.Key)
+                .ToList();
+
+            var bins = new Dictionary<int, int>();
+            for (var i = 0; i < ordered.Count; i++)
+            {
+                var value = ordered[i];
+                bins[value] = i < highCount ? 2
+                    : i < highCount + midCount ? 1
+                    : 0;
+            }
+
+            binsByColumn[col] = bins;
+        }
+
+        return binsByColumn;
+    }
+
+    private static int[] ApplyColumnBins(int[] sequence, IReadOnlyDictionary<int, Dictionary<int, int>> columnBins)
+    {
+        var binned = new int[sequence.Length];
+        for (var i = 0; i < sequence.Length; i++)
+        {
+            if (columnBins.TryGetValue(i, out var bins) && bins.TryGetValue(sequence[i], out var bin))
+            {
+                binned[i] = bin;
+            }
+            else
+            {
+                binned[i] = 0;
+            }
+        }
+
+        return binned;
+    }
+
+    private static Dictionary<int, Dictionary<int, int>> ComputeColumnValueCounts(Dictionary<int, int[]> sequences)
+    {
+        var columns = new Dictionary<int, Dictionary<int, int>>();
+        foreach (var sequence in sequences.Values)
+        {
+            for (var i = 0; i < sequence.Length; i++)
+            {
+                if (!columns.TryGetValue(i, out var counts))
+                {
+                    counts = new Dictionary<int, int>();
+                    columns[i] = counts;
+                }
+
+                var value = sequence[i];
+                counts[value] = counts.TryGetValue(value, out var count) ? count + 1 : 1;
+            }
+        }
+
+        return columns;
+    }
+
+    private static int GetModeBin(Dictionary<int, int> counts)
+    {
+        var bins = new[] { 2, 1, 0 };
+        var bestBin = bins[0];
+        var bestCount = -1;
+        foreach (var bin in bins)
+        {
+            var count = counts.TryGetValue(bin, out var value) ? value : 0;
+            if (count > bestCount)
+            {
+                bestCount = count;
+                bestBin = bin;
+            }
+        }
+
+        return bestBin;
+    }
+
+    private static int[] GetTopBins(Dictionary<int, int> counts, int topN)
+    {
+        var ordered = counts
+            .Where(kvp => kvp.Value > 0)
+            .OrderByDescending(kvp => kvp.Value)
+            .ThenByDescending(kvp => kvp.Key)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+        if (ordered.Count < topN)
+        {
+            var fallback = new[] { 2, 1, 0 };
+            foreach (var bin in fallback)
+            {
+                if (ordered.Count >= topN)
+                {
+                    break;
+                }
+
+                if (!ordered.Contains(bin))
+                {
+                    ordered.Add(bin);
+                }
+            }
+        }
+
+        return ordered.Take(topN).ToArray();
+    }
+
+    private static MotifCoverage GetTopMotifCoverage(Dictionary<int, int[]> sequences, int length)
+    {
+        var motifToIds = new Dictionary<string, HashSet<int>>();
+        foreach (var (id, sequence) in sequences)
+        {
+            if (sequence.Length < length)
+            {
+                continue;
+            }
+
+            for (var i = 0; i <= sequence.Length - length; i++)
+            {
+                var motif = string.Join("-", sequence.Skip(i).Take(length));
+                if (!motifToIds.TryGetValue(motif, out var ids))
+                {
+                    ids = new HashSet<int>();
+                    motifToIds[motif] = ids;
+                }
+
+                ids.Add(id);
+            }
+        }
+
+        if (motifToIds.Count == 0)
+        {
+            return new MotifCoverage(string.Empty, 0, length);
+        }
+
+        var best = motifToIds
+            .OrderByDescending(kvp => kvp.Value.Count)
+            .ThenBy(kvp => kvp.Key)
+            .First();
+
+        return new MotifCoverage(best.Key, best.Value.Count, length);
+    }
+
+    private static int CountNearSharedMotifs(Dictionary<int, int[]> sequences, int length, int maxDistance)
+    {
+        var motifs = new List<(int Id, int[] Values, string Key)>();
+        foreach (var (id, sequence) in sequences)
+        {
+            if (sequence.Length < length)
+            {
+                continue;
+            }
+
+            for (var i = 0; i <= sequence.Length - length; i++)
+            {
+                var values = sequence.Skip(i).Take(length).ToArray();
+                var key = string.Join("-", values);
+                motifs.Add((id, values, key));
+            }
+        }
+
+        var matched = new HashSet<string>();
+        for (var i = 0; i < motifs.Count; i++)
+        {
+            for (var j = i + 1; j < motifs.Count; j++)
+            {
+                if (motifs[i].Id == motifs[j].Id)
+                {
+                    continue;
+                }
+
+                if (HammingDistance(motifs[i].Values, motifs[j].Values, maxDistance) <= maxDistance)
+                {
+                    matched.Add(motifs[i].Key);
+                    matched.Add(motifs[j].Key);
+                }
+            }
+        }
+
+        return matched.Count;
+    }
+
+    private static int HammingDistance(int[] left, int[] right, int maxDistance)
+    {
+        var distance = 0;
+        for (var i = 0; i < left.Length; i++)
+        {
+            if (left[i] != right[i])
+            {
+                distance++;
+                if (distance > maxDistance)
+                {
+                    return distance;
+                }
+            }
+        }
+
+        return distance;
+    }
+
     private static Dictionary<int, ColumnStat> ComputeColumnStats(Dictionary<int, int[]> sequences)
     {
         var columns = new Dictionary<int, Dictionary<int, int>>();
@@ -3709,6 +8712,4263 @@ public static class HypothesisCatalog
         {
             failures.Add($"{label}:{index}:extra");
         }
+    }
+
+    private static IReadOnlyList<CellEntropyStat> ComputeCellEntropyStats(IReadOnlyList<EyeMessage> messages)
+    {
+        var counts = new Dictionary<(int Row, int Col), Dictionary<int, int>>();
+        var coverage = new Dictionary<(int Row, int Col), int>();
+
+        foreach (var message in messages)
+        {
+            var seen = new HashSet<(int Row, int Col)>();
+            for (var row = 0; row < message.Lines.Count; row++)
+            {
+                var line = message.Lines[row];
+                for (var col = 0; col < line.Length; col++)
+                {
+                    var value = line[col] - '0';
+                    var key = (row, col);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    map[value] = map.TryGetValue(value, out var existing) ? existing + 1 : 1;
+                    seen.Add(key);
+                }
+            }
+
+            foreach (var key in seen)
+            {
+                coverage[key] = coverage.TryGetValue(key, out var existing) ? existing + 1 : 1;
+            }
+        }
+
+        var stats = new List<CellEntropyStat>();
+        foreach (var (key, map) in counts)
+        {
+            var total = map.Values.Sum();
+            var max = map.Values.Max();
+            var maxValues = map.Where(kvp => kvp.Value == max)
+                .Select(kvp => kvp.Key)
+                .OrderBy(v => v)
+                .ToArray();
+            var entropy = ComputeEntropy(map.Values, total);
+            var maxProb = max / (double)total;
+            var cov = coverage.TryGetValue(key, out var covCount) ? covCount : 0;
+
+            stats.Add(new CellEntropyStat(
+                key.Row,
+                key.Col,
+                cov,
+                entropy,
+                maxProb,
+                maxValues));
+        }
+
+        return stats;
+    }
+
+    private static Dictionary<(int Row, int Col), CellValueSet> ComputeCellValueSets(
+        IReadOnlyList<EyeMessage> messages,
+        IReadOnlySet<int> messageIds)
+    {
+        var sets = new Dictionary<(int Row, int Col), HashSet<int>>();
+        var coverage = new Dictionary<(int Row, int Col), int>();
+
+        foreach (var message in messages.Where(m => messageIds.Contains(m.Id)))
+        {
+            var seen = new HashSet<(int Row, int Col)>();
+            for (var row = 0; row < message.Lines.Count; row++)
+            {
+                var line = message.Lines[row];
+                for (var col = 0; col < line.Length; col++)
+                {
+                    var value = line[col] - '0';
+                    var key = (row, col);
+                    if (!sets.TryGetValue(key, out var set))
+                    {
+                        set = new HashSet<int>();
+                        sets[key] = set;
+                    }
+
+                    set.Add(value);
+                    seen.Add(key);
+                }
+            }
+
+            foreach (var key in seen)
+            {
+                coverage[key] = coverage.TryGetValue(key, out var existing) ? existing + 1 : 1;
+            }
+        }
+
+        return sets.ToDictionary(
+            kvp => kvp.Key,
+            kvp => new CellValueSet(
+                coverage.TryGetValue(kvp.Key, out var cov) ? cov : 0,
+                kvp.Value.OrderBy(v => v).ToArray()));
+    }
+
+    private static (int Intersection, int Union, double Jaccard) ComputeJaccard(int[] left, int[] right)
+    {
+        if (left.Length == 0 && right.Length == 0)
+        {
+            return (0, 0, 0.0);
+        }
+
+        var leftSet = new HashSet<int>(left);
+        var rightSet = new HashSet<int>(right);
+        var intersection = leftSet.Intersect(rightSet).Count();
+        var union = leftSet.Union(rightSet).Count();
+        var jaccard = union == 0 ? 0.0 : intersection / (double)union;
+        return (intersection, union, jaccard);
+    }
+
+    private static ColumnSubstitutionStats ComputeColumnSubstitutionStats(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var mapping = new Dictionary<(int Index, int Value), HashSet<int>>();
+        var pairCount = 0;
+        var aligned = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            pairCount++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                var stepIndex = 0;
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue)
+                    {
+                        aligned++;
+                        var key = (stepIndex, step.ValueA.Value);
+                        if (!mapping.TryGetValue(key, out var set))
+                        {
+                            set = new HashSet<int>();
+                            mapping[key] = set;
+                        }
+
+                        set.Add(step.ValueB.Value);
+                    }
+
+                    stepIndex++;
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                aligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var key = (i, east[i]);
+                    if (!mapping.TryGetValue(key, out var set))
+                    {
+                        set = new HashSet<int>();
+                        mapping[key] = set;
+                    }
+
+                    set.Add(west[i]);
+                }
+            }
+        }
+
+        var conflicts = mapping
+            .Where(kvp => kvp.Value.Count > 1)
+            .Select(kvp => new ColumnSubstitutionConflict(
+                kvp.Key.Index,
+                kvp.Key.Value,
+                kvp.Value.OrderBy(v => v).ToArray()))
+            .OrderBy(c => c.Index)
+            .ThenBy(c => c.EastValue)
+            .ToArray();
+
+        return new ColumnSubstitutionStats(
+            conflicts.Length,
+            mapping.Count,
+            pairCount,
+            aligned,
+            conflicts);
+    }
+
+    private static ColumnSubstitutionStatsWithPrev ComputeColumnSubstitutionStatsWithPrev(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var mapping = new Dictionary<(int Index, int Value, int? Prev), HashSet<int>>();
+        var pairCount = 0;
+        var aligned = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            pairCount++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                var stepIndex = 0;
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue)
+                    {
+                        aligned++;
+                        var prev = step.IndexA.HasValue && step.IndexA.Value > 0 ? east[step.IndexA.Value - 1] : (int?)null;
+                        var key = (stepIndex, step.ValueA.Value, prev);
+                        if (!mapping.TryGetValue(key, out var set))
+                        {
+                            set = new HashSet<int>();
+                            mapping[key] = set;
+                        }
+
+                        set.Add(step.ValueB.Value);
+                    }
+
+                    stepIndex++;
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                aligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var prev = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prev);
+                    if (!mapping.TryGetValue(key, out var set))
+                    {
+                        set = new HashSet<int>();
+                        mapping[key] = set;
+                    }
+
+                    set.Add(west[i]);
+                }
+            }
+        }
+
+        var conflicts = mapping
+            .Where(kvp => kvp.Value.Count > 1)
+            .Select(kvp => new ColumnSubstitutionConflictWithPrev(
+                kvp.Key.Index,
+                kvp.Key.Value,
+                kvp.Key.Prev,
+                kvp.Value.OrderBy(v => v).ToArray()))
+            .OrderBy(c => c.Index)
+            .ThenBy(c => c.EastValue)
+            .ThenBy(c => c.PrevEastValue ?? -1)
+            .ToArray();
+
+        return new ColumnSubstitutionStatsWithPrev(
+            conflicts.Length,
+            mapping.Count,
+            pairCount,
+            aligned,
+            conflicts);
+    }
+
+    private static ColumnSubstitutionStatsWithPrevWest ComputeColumnSubstitutionStatsWithPrevWest(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var mapping = new Dictionary<(int Index, int Value, int? PrevWest), HashSet<int>>();
+        var pairCount = 0;
+        var aligned = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            pairCount++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                var stepIndex = 0;
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue)
+                    {
+                        aligned++;
+                        var prevWest = step.IndexB.HasValue && step.IndexB.Value > 0 ? west[step.IndexB.Value - 1] : (int?)null;
+                        var key = (stepIndex, step.ValueA.Value, prevWest);
+                        if (!mapping.TryGetValue(key, out var set))
+                        {
+                            set = new HashSet<int>();
+                            mapping[key] = set;
+                        }
+
+                        set.Add(step.ValueB.Value);
+                    }
+
+                    stepIndex++;
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                aligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var prevWest = i > 0 ? west[i - 1] : (int?)null;
+                    var key = (i, east[i], prevWest);
+                    if (!mapping.TryGetValue(key, out var set))
+                    {
+                        set = new HashSet<int>();
+                        mapping[key] = set;
+                    }
+
+                    set.Add(west[i]);
+                }
+            }
+        }
+
+        var conflicts = mapping
+            .Where(kvp => kvp.Value.Count > 1)
+            .Select(kvp => new ColumnSubstitutionConflictWithPrevWest(
+                kvp.Key.Index,
+                kvp.Key.Value,
+                kvp.Key.PrevWest,
+                kvp.Value.OrderBy(v => v).ToArray()))
+            .OrderBy(c => c.Index)
+            .ThenBy(c => c.EastValue)
+            .ThenBy(c => c.PrevWestValue ?? -1)
+            .ToArray();
+
+        return new ColumnSubstitutionStatsWithPrevWest(
+            conflicts.Length,
+            mapping.Count,
+            pairCount,
+            aligned,
+            conflicts);
+    }
+
+    private static ColumnSubstitutionStatsWithPrevBoth ComputeColumnSubstitutionStatsWithPrevBoth(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var mapping = new Dictionary<(int Index, int Value, int? PrevEast, int? PrevWest), HashSet<int>>();
+        var pairCount = 0;
+        var aligned = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            pairCount++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                var stepIndex = 0;
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue)
+                    {
+                        aligned++;
+                        var prevEast = step.IndexA.HasValue && step.IndexA.Value > 0 ? east[step.IndexA.Value - 1] : (int?)null;
+                        var prevWest = step.IndexB.HasValue && step.IndexB.Value > 0 ? west[step.IndexB.Value - 1] : (int?)null;
+                        var key = (stepIndex, step.ValueA.Value, prevEast, prevWest);
+                        if (!mapping.TryGetValue(key, out var set))
+                        {
+                            set = new HashSet<int>();
+                            mapping[key] = set;
+                        }
+
+                        set.Add(step.ValueB.Value);
+                    }
+
+                    stepIndex++;
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                aligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var prevWest = i > 0 ? west[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast, prevWest);
+                    if (!mapping.TryGetValue(key, out var set))
+                    {
+                        set = new HashSet<int>();
+                        mapping[key] = set;
+                    }
+
+                    set.Add(west[i]);
+                }
+            }
+        }
+
+        var conflicts = mapping
+            .Where(kvp => kvp.Value.Count > 1)
+            .Select(kvp => new ColumnSubstitutionConflictWithPrevBoth(
+                kvp.Key.Index,
+                kvp.Key.Value,
+                kvp.Key.PrevEast,
+                kvp.Key.PrevWest,
+                kvp.Value.OrderBy(v => v).ToArray()))
+            .OrderBy(c => c.Index)
+            .ThenBy(c => c.EastValue)
+            .ThenBy(c => c.PrevEastValue ?? -1)
+            .ThenBy(c => c.PrevWestValue ?? -1)
+            .ToArray();
+
+        return new ColumnSubstitutionStatsWithPrevBoth(
+            conflicts.Length,
+            mapping.Count,
+            pairCount,
+            aligned,
+            conflicts);
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? PrevEast), int> BuildStatefulMapping(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? PrevEast), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                var alignedIndex = 0;
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue)
+                    {
+                        var prevEast = step.IndexA.HasValue && step.IndexA.Value > 0 ? east[step.IndexA.Value - 1] : (int?)null;
+                        var key = (alignedIndex, step.ValueA.Value, prevEast);
+                        if (!counts.TryGetValue(key, out var map))
+                        {
+                            map = new Dictionary<int, int>();
+                            counts[key] = map;
+                        }
+
+                        var valueB = step.ValueB.Value;
+                        map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                        alignedIndex++;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = west[i];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastValue, int? PrevEast), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecode(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMapping(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                var alignedIndex = 0;
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue)
+                    {
+                        totalAligned++;
+                        var prevEast = step.IndexA.HasValue && step.IndexA.Value > 0 ? east[step.IndexA.Value - 1] : (int?)null;
+                        var key = (alignedIndex, step.ValueA.Value, prevEast);
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                            }
+                        }
+
+                        alignedIndex++;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeByMotif(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        IReadOnlyDictionary<int, char> motifs,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!motifs.TryGetValue(eastId, out var motif) || motif == '?')
+            {
+                continue;
+            }
+
+            var training = pairs
+                .Where(p => p != (eastId, westId)
+                            && motifs.TryGetValue(p.EastId, out var m)
+                            && m == motif)
+                .ToList();
+
+            var mapping = BuildStatefulMapping(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                var alignedIndex = 0;
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue)
+                    {
+                        totalAligned++;
+                        var prevEast = step.IndexA.HasValue && step.IndexA.Value > 0 ? east[step.IndexA.Value - 1] : (int?)null;
+                        var key = (alignedIndex, step.ValueA.Value, prevEast);
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                            }
+                        }
+
+                        alignedIndex++;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? PrevEast), int> BuildStatefulMappingWithRunPosition(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? PrevEast), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (index, step.ValueA.Value, prevEast);
+                        if (!counts.TryGetValue(key, out var map))
+                        {
+                            map = new Dictionary<int, int>();
+                            counts[key] = map;
+                        }
+
+                        var valueB = step.ValueB.Value;
+                        map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = west[i];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastValue, int? PrevEast), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithRunPosition(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        var index = step.IndexA.Value;
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (index, step.ValueA.Value, prevEast);
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static BucketedDecodeStats EvaluateStatefulDecodeWithRunPositionLengthBuckets(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        IReadOnlyDictionary<int, int> lengthBuckets,
+        bool useAlignment)
+    {
+        var bucketCount = lengthBuckets.Count == 0 ? 0 : lengthBuckets.Values.Max() + 1;
+        var buckets = Enumerable.Range(0, bucketCount).Select(_ => new BucketDecodeStats(0, 0, 0)).ToArray();
+
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!lengthBuckets.TryGetValue(westId, out var bucket))
+            {
+                continue;
+            }
+
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                        var index = step.IndexA.Value;
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (index, step.ValueA.Value, prevEast);
+
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                                buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                            buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                        }
+                    }
+                }
+            }
+        }
+
+        return new BucketedDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect, buckets);
+    }
+
+    private static BucketedDecodeStats EvaluateStatefulDecodeWithRunPositionBuckets(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+        var buckets = new[]
+        {
+            new BucketDecodeStats(0, 0, 0),
+            new BucketDecodeStats(0, 0, 0),
+            new BucketDecodeStats(0, 0, 0),
+        };
+
+        int GetBucket(int index)
+        {
+            if (index < 10) return 0;
+            if (index < 20) return 1;
+            return 2;
+        }
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        var index = step.IndexA.Value;
+                        var bucket = GetBucket(index);
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (index, step.ValueA.Value, prevEast);
+
+                        buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                                buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var bucket = GetBucket(i);
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+
+                    buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                            buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                        }
+                    }
+                }
+            }
+        }
+
+        return new BucketedDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect, buckets);
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2), int> BuildStatefulMappingWithRunPositionPrev2(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        var prev1 = index > 0 ? east[index - 1] : (int?)null;
+                        var prev2 = index > 1 ? east[index - 2] : (int?)null;
+                        var key = (index, step.ValueA.Value, prev1, prev2);
+                        if (!counts.TryGetValue(key, out var map))
+                        {
+                            map = new Dictionary<int, int>();
+                            counts[key] = map;
+                        }
+
+                        var valueB = step.ValueB.Value;
+                        map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    var prev1 = i > 0 ? east[i - 1] : (int?)null;
+                    var prev2 = i > 1 ? east[i - 2] : (int?)null;
+                    var key = (i, east[i], prev1, prev2);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = west[i];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2, int? Prev3), int> BuildStatefulMappingWithRunPositionPrev3(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2, int? Prev3), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        var prev1 = index > 0 ? east[index - 1] : (int?)null;
+                        var prev2 = index > 1 ? east[index - 2] : (int?)null;
+                        var prev3 = index > 2 ? east[index - 3] : (int?)null;
+                        var key = (index, step.ValueA.Value, prev1, prev2, prev3);
+                        if (!counts.TryGetValue(key, out var map))
+                        {
+                            map = new Dictionary<int, int>();
+                            counts[key] = map;
+                        }
+
+                        var valueB = step.ValueB.Value;
+                        map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    var prev1 = i > 0 ? east[i - 1] : (int?)null;
+                    var prev2 = i > 1 ? east[i - 2] : (int?)null;
+                    var prev3 = i > 2 ? east[i - 3] : (int?)null;
+                    var key = (i, east[i], prev1, prev2, prev3);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = west[i];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2, int? Prev3), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static BucketedDecodeStats EvaluateStatefulDecodeWithRunPositionBucketsPrev2(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+        var buckets = new[]
+        {
+            new BucketDecodeStats(0, 0, 0),
+            new BucketDecodeStats(0, 0, 0),
+            new BucketDecodeStats(0, 0, 0),
+        };
+
+        int GetBucket(int index)
+        {
+            if (index < 10) return 0;
+            if (index < 20) return 1;
+            return 2;
+        }
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPositionPrev2(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        var index = step.IndexA.Value;
+                        var bucket = GetBucket(index);
+                        var prev1 = index > 0 ? east[index - 1] : (int?)null;
+                        var prev2 = index > 1 ? east[index - 2] : (int?)null;
+                        var key = (index, step.ValueA.Value, prev1, prev2);
+
+                        buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                                buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var bucket = GetBucket(i);
+                    var prev1 = i > 0 ? east[i - 1] : (int?)null;
+                    var prev2 = i > 1 ? east[i - 2] : (int?)null;
+                    var key = (i, east[i], prev1, prev2);
+
+                    buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                            buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                        }
+                    }
+                }
+            }
+        }
+
+        return new BucketedDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect, buckets);
+    }
+
+    private static BucketedDecodeStats EvaluateStatefulDecodeWithRunPositionBucketsPrev3(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+        var buckets = new[]
+        {
+            new BucketDecodeStats(0, 0, 0),
+            new BucketDecodeStats(0, 0, 0),
+            new BucketDecodeStats(0, 0, 0),
+        };
+
+        int GetBucket(int index)
+        {
+            if (index < 10) return 0;
+            if (index < 20) return 1;
+            return 2;
+        }
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPositionPrev3(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        var index = step.IndexA.Value;
+                        var bucket = GetBucket(index);
+                        var prev1 = index > 0 ? east[index - 1] : (int?)null;
+                        var prev2 = index > 1 ? east[index - 2] : (int?)null;
+                        var prev3 = index > 2 ? east[index - 3] : (int?)null;
+                        var key = (index, step.ValueA.Value, prev1, prev2, prev3);
+
+                        buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                                buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var bucket = GetBucket(i);
+                    var prev1 = i > 0 ? east[i - 1] : (int?)null;
+                    var prev2 = i > 1 ? east[i - 2] : (int?)null;
+                    var prev3 = i > 2 ? east[i - 3] : (int?)null;
+                    var key = (i, east[i], prev1, prev2, prev3);
+
+                    buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                            buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                        }
+                    }
+                }
+            }
+        }
+
+        return new BucketedDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect, buckets);
+    }
+
+    private static Dictionary<(int Bucket, int EastValue, int? PrevEast), int> BuildStatefulMappingWithBucketKey(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var counts = new Dictionary<(int Bucket, int EastValue, int? PrevEast), Dictionary<int, int>>();
+
+        int GetBucket(int index)
+        {
+            if (index < 10) return 0;
+            if (index < 20) return 1;
+            return 2;
+        }
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        var bucket = GetBucket(index);
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (bucket, step.ValueA.Value, prevEast);
+                        if (!counts.TryGetValue(key, out var map))
+                        {
+                            map = new Dictionary<int, int>();
+                            counts[key] = map;
+                        }
+
+                        var valueB = step.ValueB.Value;
+                        map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    var bucket = GetBucket(i);
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (bucket, east[i], prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = west[i];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Bucket, int EastValue, int? PrevEast), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static Dictionary<(int Bucket, int EastValue, int? PrevEast), int> BuildStatefulMappingWithNormalizedBucket(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment,
+        int bucketCount)
+    {
+        var counts = new Dictionary<(int Bucket, int EastValue, int? PrevEast), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        var bucket = GetNormalizedBucket(index, east.Length, bucketCount);
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (bucket, step.ValueA.Value, prevEast);
+                        if (!counts.TryGetValue(key, out var map))
+                        {
+                            map = new Dictionary<int, int>();
+                            counts[key] = map;
+                        }
+
+                        var valueB = step.ValueB.Value;
+                        map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    var bucket = GetNormalizedBucket(i, east.Length, bucketCount);
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (bucket, east[i], prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = west[i];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Bucket, int EastValue, int? PrevEast), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static BucketedDecodeStats EvaluateStatefulDecodeWithBucketKey(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+        var buckets = new[]
+        {
+            new BucketDecodeStats(0, 0, 0),
+            new BucketDecodeStats(0, 0, 0),
+            new BucketDecodeStats(0, 0, 0),
+        };
+
+        int GetBucket(int index)
+        {
+            if (index < 10) return 0;
+            if (index < 20) return 1;
+            return 2;
+        }
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithBucketKey(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        var index = step.IndexA.Value;
+                        var bucket = GetBucket(index);
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (bucket, step.ValueA.Value, prevEast);
+
+                        buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                                buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var bucket = GetBucket(i);
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (bucket, east[i], prevEast);
+
+                    buckets[bucket] = buckets[bucket] with { Aligned = buckets[bucket].Aligned + 1 };
+
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        buckets[bucket] = buckets[bucket] with { Covered = buckets[bucket].Covered + 1 };
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                            buckets[bucket] = buckets[bucket] with { Correct = buckets[bucket].Correct + 1 };
+                        }
+                    }
+                }
+            }
+        }
+
+        return new BucketedDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect, buckets);
+    }
+
+    private static BucketedDecodeStats EvaluateStatefulDecodeWithNormalizedBucketByLength(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        IReadOnlyDictionary<int, int> lengthBuckets,
+        bool useAlignment,
+        int bucketCount = 3)
+    {
+        var lengthBucketCount = lengthBuckets.Count == 0 ? 0 : lengthBuckets.Values.Max() + 1;
+        var buckets = Enumerable.Range(0, lengthBucketCount).Select(_ => new BucketDecodeStats(0, 0, 0)).ToArray();
+
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!lengthBuckets.TryGetValue(westId, out var lengthBucket))
+            {
+                continue;
+            }
+
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithNormalizedBucket(sequences, training, useAlignment, bucketCount);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        buckets[lengthBucket] = buckets[lengthBucket] with { Aligned = buckets[lengthBucket].Aligned + 1 };
+
+                        var index = step.IndexA.Value;
+                        var bucket = GetNormalizedBucket(index, east.Length, bucketCount);
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (bucket, step.ValueA.Value, prevEast);
+
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            buckets[lengthBucket] = buckets[lengthBucket] with { Covered = buckets[lengthBucket].Covered + 1 };
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                                buckets[lengthBucket] = buckets[lengthBucket] with { Correct = buckets[lengthBucket].Correct + 1 };
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    buckets[lengthBucket] = buckets[lengthBucket] with { Aligned = buckets[lengthBucket].Aligned + 1 };
+
+                    var bucket = GetNormalizedBucket(i, east.Length, bucketCount);
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (bucket, east[i], prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        buckets[lengthBucket] = buckets[lengthBucket] with { Covered = buckets[lengthBucket].Covered + 1 };
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                            buckets[lengthBucket] = buckets[lengthBucket] with { Correct = buckets[lengthBucket].Correct + 1 };
+                        }
+                    }
+                }
+            }
+        }
+
+        return new BucketedDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect, buckets);
+    }
+
+    private static Dictionary<int, HashSet<int>> BuildAllowedWestSets(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var allowed = new Dictionary<int, HashSet<int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        if (!allowed.TryGetValue(index, out var set))
+                        {
+                            set = new HashSet<int>();
+                            allowed[index] = set;
+                        }
+
+                        set.Add(step.ValueB.Value);
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    if (!allowed.TryGetValue(i, out var set))
+                    {
+                        set = new HashSet<int>();
+                        allowed[i] = set;
+                    }
+
+                    set.Add(west[i]);
+                }
+            }
+        }
+
+        return allowed;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithRunPositionConstrained(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment);
+            var allowed = BuildAllowedWestSets(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        var index = step.IndexA.Value;
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (index, step.ValueA.Value, prevEast);
+                        if (mapping.TryGetValue(key, out var predicted)
+                            && allowed.TryGetValue(index, out var set)
+                            && set.Contains(predicted))
+                        {
+                            totalCovered++;
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (mapping.TryGetValue(key, out var predicted)
+                        && allowed.TryGetValue(i, out var set)
+                        && set.Contains(predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? PrevEast), int> BuildStatefulMappingWithRunPositionOffset(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        int maxOffset)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? PrevEast), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            var offset = FindBestOffset(east, west, maxOffset);
+            var startEast = Math.Max(0, -offset);
+            var startWest = Math.Max(0, offset);
+            var len = Math.Min(east.Length - startEast, west.Length - startWest);
+
+            for (var i = 0; i < len; i++)
+            {
+                var indexA = startEast + i;
+                var indexB = startWest + i;
+                var prevEast = indexA > 0 ? east[indexA - 1] : (int?)null;
+                var key = (indexA, east[indexA], prevEast);
+                if (!counts.TryGetValue(key, out var map))
+                {
+                    map = new Dictionary<int, int>();
+                    counts[key] = map;
+                }
+
+                var valueB = west[indexB];
+                map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastValue, int? PrevEast), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithRunPositionOffset(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        int maxOffset)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPositionOffset(sequences, training, maxOffset);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            var offset = FindBestOffset(east, west, maxOffset);
+            var startEast = Math.Max(0, -offset);
+            var startWest = Math.Max(0, offset);
+            var len = Math.Min(east.Length - startEast, west.Length - startWest);
+
+            totalAligned += len;
+            for (var i = 0; i < len; i++)
+            {
+                var indexA = startEast + i;
+                var indexB = startWest + i;
+                var prevEast = indexA > 0 ? east[indexA - 1] : (int?)null;
+                var key = (indexA, east[indexA], prevEast);
+                if (mapping.TryGetValue(key, out var predicted))
+                {
+                    totalCovered++;
+                    if (predicted == west[indexB])
+                    {
+                        totalCorrect++;
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static int FindBestOffset(int[] east, int[] west, int maxOffset)
+    {
+        var bestOffset = 0;
+        var bestMatches = -1;
+        var bestAbs = int.MaxValue;
+
+        for (var offset = -maxOffset; offset <= maxOffset; offset++)
+        {
+            var startEast = Math.Max(0, -offset);
+            var startWest = Math.Max(0, offset);
+            var len = Math.Min(east.Length - startEast, west.Length - startWest);
+            if (len <= 0)
+            {
+                continue;
+            }
+
+            var matches = 0;
+            for (var i = 0; i < len; i++)
+            {
+                if (east[startEast + i] == west[startWest + i])
+                {
+                    matches++;
+                }
+            }
+
+            var abs = Math.Abs(offset);
+            if (matches > bestMatches || (matches == bestMatches && (abs < bestAbs || (abs == bestAbs && offset < bestOffset))))
+            {
+                bestMatches = matches;
+                bestAbs = abs;
+                bestOffset = offset;
+            }
+        }
+
+        return bestOffset;
+    }
+
+    private static List<(int EastId, int WestId)> BuildWithinSidePairs(
+        IEnumerable<int> ids,
+        IReadOnlyDictionary<int, int[]> sequences)
+    {
+        var available = ids.Where(id => sequences.ContainsKey(id)).ToArray();
+        var pairs = new List<(int EastId, int WestId)>();
+        for (var i = 0; i < available.Length; i++)
+        {
+            for (var j = 0; j < available.Length; j++)
+            {
+                if (i == j)
+                {
+                    continue;
+                }
+
+                pairs.Add((available[i], available[j]));
+            }
+        }
+
+        return pairs;
+    }
+
+    private static List<(int EastId, int WestId)> BuildCrossSidePairs(
+        IEnumerable<int> eastIds,
+        IEnumerable<int> westIds)
+    {
+        var pairs = new List<(int EastId, int WestId)>();
+        foreach (var east in eastIds)
+        {
+            foreach (var west in westIds)
+            {
+                pairs.Add((east, west));
+            }
+        }
+
+        return pairs;
+    }
+
+    private static (int Conflicts, int Mappings) ComputeStatefulMappingConflicts(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var mapping = new Dictionary<(int Index, int EastValue, int? PrevEast), HashSet<int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (index, step.ValueA.Value, prevEast);
+                        if (!mapping.TryGetValue(key, out var set))
+                        {
+                            set = new HashSet<int>();
+                            mapping[key] = set;
+                        }
+
+                        set.Add(step.ValueB.Value);
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (!mapping.TryGetValue(key, out var set))
+                    {
+                        set = new HashSet<int>();
+                        mapping[key] = set;
+                    }
+
+                    set.Add(west[i]);
+                }
+            }
+        }
+
+        var conflicts = mapping.Count(kvp => kvp.Value.Count > 1);
+        return (conflicts, mapping.Count);
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithRunPositionUsingMapping(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        Dictionary<(int Index, int EastValue, int? PrevEast), int> mapping,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        totalAligned++;
+                        var index = step.IndexA.Value;
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        var key = (index, step.ValueA.Value, prevEast);
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                totalAligned += len;
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static (Dictionary<int, int> BinMap, Dictionary<int, HashSet<int>> AllowedBins) BuildAllowedBinSets(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs)
+    {
+        var westSequences = new List<int[]>();
+        foreach (var (_, westId) in pairs)
+        {
+            if (sequences.TryGetValue(westId, out var west) && west.Length > 0)
+            {
+                westSequences.Add(west);
+            }
+        }
+
+        var sourceSequences = westSequences.Count > 0 ? westSequences : sequences.Values.ToList();
+        var binMap = BuildFrequencyBins(sourceSequences, highCount: 8, midCount: 8);
+
+        var allowedBins = new Dictionary<int, HashSet<int>>();
+        foreach (var west in westSequences)
+        {
+            for (var i = 0; i < west.Length; i++)
+            {
+                var bin = binMap[west[i]];
+                if (!allowedBins.TryGetValue(i, out var set))
+                {
+                    set = new HashSet<int>();
+                    allowedBins[i] = set;
+                }
+
+                set.Add(bin);
+            }
+        }
+
+        return (binMap, allowedBins);
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithRunPositionBinConstraints(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment: true);
+            var (binMap, allowedBins) = BuildAllowedBinSets(sequences, training);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            var alignment = SequenceAlignment.Align(east, west);
+            foreach (var step in alignment.Steps)
+            {
+                if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                {
+                    totalAligned++;
+                    var index = step.IndexA.Value;
+                    var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                    var key = (index, step.ValueA.Value, prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        var bin = binMap[predicted];
+                        if (allowedBins.TryGetValue(index, out var allowed) && allowed.Contains(bin))
+                        {
+                            totalCovered++;
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? PrevEast), Dictionary<int, int>> BuildStatefulMappingCountsWithRunPosition(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? PrevEast), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                foreach (var (index, eastValue, westValue) in EnumerateAlignedValues(east, west, useAlignment: true))
+                {
+                    var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                    var key = (index, eastValue, prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    map[westValue] = map.TryGetValue(westValue, out var existing) ? existing + 1 : 1;
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    var key = (i, east[i], prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = west[i];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        return counts;
+    }
+
+    private static int? SelectCandidateWithBinBonus(
+        Dictionary<int, int> counts,
+        IReadOnlyDictionary<int, int> binMap,
+        HashSet<int>? allowedBins,
+        double binBonus)
+    {
+        var bestValue = (int?)null;
+        var bestScore = double.NegativeInfinity;
+
+        foreach (var (value, count) in counts)
+        {
+            var score = (double)count;
+            if (allowedBins != null && allowedBins.Contains(binMap[value]))
+            {
+                score += binBonus;
+            }
+
+            if (score > bestScore || (Math.Abs(score - bestScore) < 1e-9 && (bestValue == null || value < bestValue)))
+            {
+                bestScore = score;
+                bestValue = value;
+            }
+        }
+
+        return bestValue;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithAdaptiveConstraints(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment,
+        double binBonus)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mappingCounts = BuildStatefulMappingCountsWithRunPosition(sequences, training, useAlignment);
+            var (binMap, allowedBins) = BuildAllowedBinSets(sequences, training);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            foreach (var (index, eastValue, westValue) in EnumerateAlignedValues(east, west, useAlignment))
+            {
+                totalAligned++;
+                var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                var key = (index, eastValue, prevEast);
+                if (mappingCounts.TryGetValue(key, out var counts))
+                {
+                    allowedBins.TryGetValue(index, out var allowed);
+                    var predicted = SelectCandidateWithBinBonus(counts, binMap, allowed, binBonus);
+                    if (predicted.HasValue)
+                    {
+                        totalCovered++;
+                        if (predicted.Value == westValue)
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithEntropyGatedBinConstraints(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment,
+        double entropyThreshold,
+        double overlapThreshold)
+    {
+        var eastIds = new HashSet<int> { 0, 2, 4, 6, 8 };
+        var westIds = new HashSet<int> { 1, 3, 5, 7 };
+
+        var eastSequences = sequences.Where(kvp => eastIds.Contains(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        var westSequences = sequences.Where(kvp => westIds.Contains(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+        var entropyStats = ComputeColumnStats(sequences);
+        var eastSets = ComputeColumnValueSets(eastSequences, minCoverage: 4);
+        var westSets = ComputeColumnValueSets(westSequences, minCoverage: 2);
+
+        var overlapByColumn = new Dictionary<int, double>();
+        foreach (var col in eastSets.Keys.Intersect(westSets.Keys))
+        {
+            overlapByColumn[col] = ComputeJaccard(eastSets[col].Values, westSets[col].Values).Jaccard;
+        }
+
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment);
+            var (binMap, allowedBins) = BuildAllowedBinSets(sequences, training);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            foreach (var (index, eastValue, westValue) in EnumerateAlignedValues(east, west, useAlignment))
+            {
+                totalAligned++;
+                var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                var key = (index, eastValue, prevEast);
+                if (!mapping.TryGetValue(key, out var predicted))
+                {
+                    continue;
+                }
+
+                var applyConstraint = entropyStats.TryGetValue(index, out var stat)
+                                      && stat.Entropy <= entropyThreshold
+                                      && overlapByColumn.TryGetValue(index, out var overlap)
+                                      && overlap >= overlapThreshold;
+
+                if (applyConstraint)
+                {
+                    if (!allowedBins.TryGetValue(index, out var allowed))
+                    {
+                        continue;
+                    }
+
+                    var bin = binMap[predicted];
+                    if (!allowed.Contains(bin))
+                    {
+                        continue;
+                    }
+                }
+
+                totalCovered++;
+                if (predicted == westValue)
+                {
+                    totalCorrect++;
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithRunPositionWindow(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment,
+        int minIndexInclusive,
+        int? maxIndexExclusive)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            foreach (var (index, eastValue, westValue) in EnumerateAlignedValues(east, west, useAlignment))
+            {
+                if (index < minIndexInclusive || (maxIndexExclusive.HasValue && index >= maxIndexExclusive.Value))
+                {
+                    continue;
+                }
+
+                totalAligned++;
+                var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                var key = (index, eastValue, prevEast);
+                if (mapping.TryGetValue(key, out var predicted))
+                {
+                    totalCovered++;
+                    if (predicted == westValue)
+                    {
+                        totalCorrect++;
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static bool TryGetRowPairRunStartIndex(EyeMessage message, int rowPair, out int startIndex)
+    {
+        var sequence = GetBodyRowPairSequence(message);
+        for (var i = 0; i < sequence.Length; i++)
+        {
+            if (sequence[i] == rowPair)
+            {
+                startIndex = i;
+                return true;
+            }
+        }
+
+        startIndex = -1;
+        return false;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithAnchorOffsets(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        IReadOnlyDictionary<int, int> anchorStarts)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!anchorStarts.TryGetValue(eastId, out var eastStart) || !anchorStarts.TryGetValue(westId, out var westStart))
+            {
+                continue;
+            }
+
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var counts = new Dictionary<(int Index, int EastValue, int? PrevEast), Dictionary<int, int>>();
+            foreach (var (trainEastId, trainWestId) in training)
+            {
+                if (!anchorStarts.TryGetValue(trainEastId, out var trainEastStart)
+                    || !anchorStarts.TryGetValue(trainWestId, out var trainWestStart))
+                {
+                    continue;
+                }
+
+                if (!sequences.TryGetValue(trainEastId, out var trainEast)
+                    || !sequences.TryGetValue(trainWestId, out var trainWest)
+                    || trainEast.Length == 0
+                    || trainWest.Length == 0)
+                {
+                    continue;
+                }
+
+                var offset = trainEastStart - trainWestStart;
+                for (var i = 0; i < trainEast.Length; i++)
+                {
+                    var j = i + offset;
+                    if (j < 0 || j >= trainWest.Length)
+                    {
+                        continue;
+                    }
+
+                    var prevEast = i > 0 ? trainEast[i - 1] : (int?)null;
+                    var key = (i, trainEast[i], prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = trainWest[j];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+
+            var mapping = new Dictionary<(int Index, int EastValue, int? PrevEast), int>();
+            foreach (var (key, map) in counts)
+            {
+                var bestValue = int.MaxValue;
+                var bestCount = -1;
+                foreach (var (value, count) in map)
+                {
+                    if (count > bestCount || (count == bestCount && value < bestValue))
+                    {
+                        bestCount = count;
+                        bestValue = value;
+                    }
+                }
+
+                mapping[key] = bestValue;
+            }
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            var evalOffset = eastStart - westStart;
+            for (var i = 0; i < east.Length; i++)
+            {
+                var j = i + evalOffset;
+                if (j < 0 || j >= west.Length)
+                {
+                    continue;
+                }
+
+                totalAligned++;
+                var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                var key = (i, east[i], prevEast);
+                if (mapping.TryGetValue(key, out var predicted))
+                {
+                    totalCovered++;
+                    if (predicted == west[j])
+                    {
+                        totalCorrect++;
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static StatefulDecodeStats EvaluateConditionalDigitMapping(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        Func<int, int> conditionSelector,
+        Func<int, int> targetSelector,
+        bool useAlignment)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildConditionalDigitMappingWithRunPosition(sequences, training, conditionSelector, targetSelector, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            foreach (var (index, _, westValue) in EnumerateAlignedValues(east, west, useAlignment))
+            {
+                totalAligned++;
+                var condition = conditionSelector(westValue);
+                var key = (index, condition);
+                if (mapping.TryGetValue(key, out var predicted))
+                {
+                    totalCovered++;
+                    if (predicted == targetSelector(westValue))
+                    {
+                        totalCorrect++;
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static StatefulDecodeStats EvaluateTwoStageDigitDecode(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment,
+        TwoStageDigitMode mode)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var topMapping = BuildDigitMappingWithRunPosition(sequences, training, value => value / 5, useAlignment);
+            var bottomMapping = BuildDigitMappingWithRunPosition(sequences, training, value => value % 5, useAlignment);
+            var bottomGivenTop = BuildConditionalDigitMappingWithRunPosition(sequences, training, value => value / 5, value => value % 5, useAlignment);
+            var topGivenBottom = BuildConditionalDigitMappingWithRunPosition(sequences, training, value => value % 5, value => value / 5, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            foreach (var (index, eastValue, westValue) in EnumerateAlignedValues(east, west, useAlignment))
+            {
+                totalAligned++;
+                var eastTop = eastValue / 5;
+                var eastBottom = eastValue % 5;
+                var prevEastTop = index > 0 ? east[index - 1] / 5 : (int?)null;
+                var prevEastBottom = index > 0 ? east[index - 1] % 5 : (int?)null;
+
+                int? predictedTop = null;
+                int? predictedBottom = null;
+
+                if (mode == TwoStageDigitMode.Independent || mode == TwoStageDigitMode.TopThenConditionalBottom)
+                {
+                    var topKey = (index, eastTop, prevEastTop);
+                    if (topMapping.TryGetValue(topKey, out var topPred))
+                    {
+                        predictedTop = topPred;
+                    }
+                }
+
+                if (mode == TwoStageDigitMode.Independent || mode == TwoStageDigitMode.BottomThenConditionalTop)
+                {
+                    var bottomKey = (index, eastBottom, prevEastBottom);
+                    if (bottomMapping.TryGetValue(bottomKey, out var bottomPred))
+                    {
+                        predictedBottom = bottomPred;
+                    }
+                }
+
+                if (mode == TwoStageDigitMode.TopThenConditionalBottom)
+                {
+                    if (predictedTop.HasValue && bottomGivenTop.TryGetValue((index, predictedTop.Value), out var bottomPred))
+                    {
+                        predictedBottom = bottomPred;
+                    }
+                    else
+                    {
+                        predictedBottom = null;
+                    }
+                }
+                else if (mode == TwoStageDigitMode.BottomThenConditionalTop)
+                {
+                    if (predictedBottom.HasValue && topGivenBottom.TryGetValue((index, predictedBottom.Value), out var topPred))
+                    {
+                        predictedTop = topPred;
+                    }
+                    else
+                    {
+                        predictedTop = null;
+                    }
+                }
+
+                if (predictedTop.HasValue && predictedBottom.HasValue)
+                {
+                    totalCovered++;
+                    var predictedValue = predictedTop.Value * 5 + predictedBottom.Value;
+                    if (predictedValue == westValue)
+                    {
+                        totalCorrect++;
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static Dictionary<(int Index, int EastDigit, int? PrevEastDigit), int> BuildDigitMappingWithRunPosition(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        Func<int, int> digitSelector,
+        bool useAlignment)
+    {
+        var counts = new Dictionary<(int Index, int EastDigit, int? PrevEastDigit), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            foreach (var (index, eastValue, westValue) in EnumerateAlignedValues(east, west, useAlignment))
+            {
+                var eastDigit = digitSelector(eastValue);
+                var prevEastDigit = index > 0 ? digitSelector(east[index - 1]) : (int?)null;
+                var key = (index, eastDigit, prevEastDigit);
+                if (!counts.TryGetValue(key, out var map))
+                {
+                    map = new Dictionary<int, int>();
+                    counts[key] = map;
+                }
+
+                var westDigit = digitSelector(westValue);
+                map[westDigit] = map.TryGetValue(westDigit, out var existing) ? existing + 1 : 1;
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastDigit, int? PrevEastDigit), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static Dictionary<(int Index, int ConditionDigit), int> BuildConditionalDigitMappingWithRunPosition(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        Func<int, int> conditionSelector,
+        Func<int, int> targetSelector,
+        bool useAlignment)
+    {
+        var counts = new Dictionary<(int Index, int ConditionDigit), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            foreach (var (index, _, westValue) in EnumerateAlignedValues(east, west, useAlignment))
+            {
+                var condition = conditionSelector(westValue);
+                var key = (index, condition);
+                if (!counts.TryGetValue(key, out var map))
+                {
+                    map = new Dictionary<int, int>();
+                    counts[key] = map;
+                }
+
+                var target = targetSelector(westValue);
+                map[target] = map.TryGetValue(target, out var existing) ? existing + 1 : 1;
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int ConditionDigit), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static IEnumerable<(int Index, int EastValue, int WestValue)> EnumerateAlignedValues(
+        int[] east,
+        int[] west,
+        bool useAlignment)
+    {
+        if (useAlignment)
+        {
+            var alignment = SequenceAlignment.Align(east, west);
+            foreach (var step in alignment.Steps)
+            {
+                if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                {
+                    yield return (step.IndexA.Value, step.ValueA.Value, step.ValueB.Value);
+                }
+            }
+
+            yield break;
+        }
+
+        var len = Math.Min(east.Length, west.Length);
+        for (var i = 0; i < len; i++)
+        {
+            yield return (i, east[i], west[i]);
+        }
+    }
+
+    private static IEnumerable<AlignmentStep> OffsetAlignmentSteps(
+        IReadOnlyList<AlignmentStep> steps,
+        int offsetA,
+        int offsetB)
+    {
+        foreach (var step in steps)
+        {
+            var indexA = step.IndexA.HasValue ? step.IndexA + offsetA : null;
+            var indexB = step.IndexB.HasValue ? step.IndexB + offsetB : null;
+            yield return new AlignmentStep(indexA, indexB, step.ValueA, step.ValueB);
+        }
+    }
+
+    private static IReadOnlyList<AlignmentStep> AlignSegmented(int[] east, int[] west, int splitIndex)
+    {
+        var steps = new List<AlignmentStep>();
+
+        var startA = Math.Min(splitIndex, east.Length);
+        var startB = Math.Min(splitIndex, west.Length);
+
+        var earlyA = east.Take(startA).ToArray();
+        var earlyB = west.Take(startB).ToArray();
+
+        if (earlyA.Length > 0 || earlyB.Length > 0)
+        {
+            var early = SequenceAlignment.Align(earlyA, earlyB);
+            steps.AddRange(OffsetAlignmentSteps(early.Steps, 0, 0));
+        }
+
+        var lateA = east.Skip(startA).ToArray();
+        var lateB = west.Skip(startB).ToArray();
+        if (lateA.Length > 0 || lateB.Length > 0)
+        {
+            var late = SequenceAlignment.Align(lateA, lateB);
+            steps.AddRange(OffsetAlignmentSteps(late.Steps, startA, startB));
+        }
+
+        return steps;
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? PrevEast), int> BuildStatefulMappingWithSegmentedAlignment(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        int splitIndex)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? PrevEast), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            var steps = AlignSegmented(east, west, splitIndex);
+            foreach (var step in steps)
+            {
+                if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                {
+                    var index = step.IndexA.Value;
+                    var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                    var key = (index, step.ValueA.Value, prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = step.ValueB.Value;
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastValue, int? PrevEast), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithSegmentedAlignment(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        int splitIndex)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithSegmentedAlignment(sequences, training, splitIndex);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            var steps = AlignSegmented(east, west, splitIndex);
+            foreach (var step in steps)
+            {
+                if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                {
+                    totalAligned++;
+                    var index = step.IndexA.Value;
+                    var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                    var key = (index, step.ValueA.Value, prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == step.ValueB.Value)
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static IReadOnlyList<AlignmentStep> AlignByBins(
+        int[] east,
+        int[] west,
+        IReadOnlyDictionary<int, int> binMap)
+    {
+        var eastBins = east.Select(v => binMap[v]).ToArray();
+        var westBins = west.Select(v => binMap[v]).ToArray();
+        return SequenceAlignment.Align(eastBins, westBins).Steps;
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? PrevEast), int> BuildStatefulMappingWithBinAlignment(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        IReadOnlyDictionary<int, int> binMap)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? PrevEast), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            var steps = AlignByBins(east, west, binMap);
+            foreach (var step in steps)
+            {
+                if (step.IndexA.HasValue && step.IndexB.HasValue)
+                {
+                    var indexA = step.IndexA.Value;
+                    var indexB = step.IndexB.Value;
+                    var valueA = east[indexA];
+                    var valueB = west[indexB];
+                    var prevEast = indexA > 0 ? east[indexA - 1] : (int?)null;
+                    var key = (indexA, valueA, prevEast);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastValue, int? PrevEast), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithBinAlignment(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        IReadOnlyDictionary<int, int> binMap)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithBinAlignment(sequences, training, binMap);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            var steps = AlignByBins(east, west, binMap);
+            foreach (var step in steps)
+            {
+                if (step.IndexA.HasValue && step.IndexB.HasValue)
+                {
+                    totalAligned++;
+                    var indexA = step.IndexA.Value;
+                    var indexB = step.IndexB.Value;
+                    var prevEast = indexA > 0 ? east[indexA - 1] : (int?)null;
+                    var key = (indexA, east[indexA], prevEast);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == west[indexB])
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static Dictionary<int, HashSet<int>> BuildHybridAllowedSetsFromWest(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs)
+    {
+        var westSequences = new List<int[]>();
+        foreach (var (_, westId) in pairs)
+        {
+            if (sequences.TryGetValue(westId, out var west) && west.Length > 0)
+            {
+                westSequences.Add(west);
+            }
+        }
+
+        if (westSequences.Count == 0)
+        {
+            return new Dictionary<int, HashSet<int>>();
+        }
+
+        var binMap = BuildFrequencyBins(westSequences, highCount: 8, midCount: 8);
+        var topSets = new Dictionary<int, HashSet<int>>();
+        var bottomSets = new Dictionary<int, HashSet<int>>();
+        var binSets = new Dictionary<int, HashSet<int>>();
+
+        foreach (var west in westSequences)
+        {
+            for (var i = 0; i < west.Length; i++)
+            {
+                var value = west[i];
+                var top = value / 5;
+                var bottom = value % 5;
+                var bin = binMap[value];
+
+                if (!topSets.TryGetValue(i, out var topSet))
+                {
+                    topSet = new HashSet<int>();
+                    topSets[i] = topSet;
+                }
+
+                if (!bottomSets.TryGetValue(i, out var bottomSet))
+                {
+                    bottomSet = new HashSet<int>();
+                    bottomSets[i] = bottomSet;
+                }
+
+                if (!binSets.TryGetValue(i, out var binSet))
+                {
+                    binSet = new HashSet<int>();
+                    binSets[i] = binSet;
+                }
+
+                topSet.Add(top);
+                bottomSet.Add(bottom);
+                binSet.Add(bin);
+            }
+        }
+
+        var allowed = new Dictionary<int, HashSet<int>>();
+        foreach (var index in topSets.Keys.Intersect(bottomSets.Keys).Intersect(binSets.Keys))
+        {
+            var set = new HashSet<int>();
+            for (var value = 0; value < 25; value++)
+            {
+                if (topSets[index].Contains(value / 5)
+                    && bottomSets[index].Contains(value % 5)
+                    && binSets[index].Contains(binMap[value]))
+                {
+                    set.Add(value);
+                }
+            }
+
+            allowed[index] = set;
+        }
+
+        return allowed;
+    }
+
+    private static StatefulDecodeStats EvaluateStatefulDecodeWithHybridConstraints(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment: true);
+            var allowed = BuildHybridAllowedSetsFromWest(sequences, training);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            var alignment = SequenceAlignment.Align(east, west);
+            foreach (var step in alignment.Steps)
+            {
+                if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                {
+                    totalAligned++;
+                    var index = step.IndexA.Value;
+                    var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                    var key = (index, step.ValueA.Value, prevEast);
+                    if (mapping.TryGetValue(key, out var predicted)
+                        && allowed.TryGetValue(index, out var allowedSet)
+                        && allowedSet.Contains(predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == step.ValueB.Value)
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new StatefulDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static HmmModel TrainHmmWithHeaderBodyInit(IReadOnlyList<int[]> sequences, int states, int symbols, int iterations)
+    {
+        var pi = new double[states];
+        var a = new double[states, states];
+        var b = new double[states, symbols];
+
+        var pseudo = 1e-3;
+        for (var i = 0; i < states; i++)
+        {
+            pi[i] = pseudo;
+            for (var j = 0; j < states; j++)
+            {
+                a[i, j] = pseudo;
+            }
+
+            for (var k = 0; k < symbols; k++)
+            {
+                b[i, k] = pseudo;
+            }
+        }
+
+        int GetState(int index, int length)
+        {
+            if (states <= 1)
+            {
+                return 0;
+            }
+
+            if (index <= 5)
+            {
+                return 0;
+            }
+
+            var bodyLen = Math.Max(1, length - 6);
+            var bodyIndex = index - 6;
+            var bodyStates = Math.Max(1, states - 1);
+            var ratio = bodyIndex / (double)bodyLen;
+            var bucket = (int)Math.Floor(ratio * bodyStates);
+            if (bucket >= bodyStates)
+            {
+                bucket = bodyStates - 1;
+            }
+
+            return 1 + bucket;
+        }
+
+        foreach (var seq in sequences)
+        {
+            if (seq.Length == 0)
+            {
+                continue;
+            }
+
+            var s0 = GetState(0, seq.Length);
+            pi[s0] += 1;
+            b[s0, seq[0]] += 1;
+
+            for (var t = 1; t < seq.Length; t++)
+            {
+                var sPrev = GetState(t - 1, seq.Length);
+                var s = GetState(t, seq.Length);
+                a[sPrev, s] += 1;
+                b[s, seq[t]] += 1;
+            }
+        }
+
+        Normalize(pi);
+        NormalizeRows(a);
+        NormalizeRows(b);
+
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            var piAcc = new double[states];
+            var aAcc = new double[states, states];
+            var aDen = new double[states];
+            var bAcc = new double[states, symbols];
+
+            foreach (var seq in sequences)
+            {
+                if (seq.Length == 0)
+                {
+                    continue;
+                }
+
+                var tLen = seq.Length;
+                var alpha = new double[tLen, states];
+                var beta = new double[tLen, states];
+                var scale = new double[tLen];
+
+                for (var i = 0; i < states; i++)
+                {
+                    alpha[0, i] = pi[i] * b[i, seq[0]];
+                }
+
+                scale[0] = 0;
+                for (var i = 0; i < states; i++)
+                {
+                    scale[0] += alpha[0, i];
+                }
+
+                if (scale[0] == 0)
+                {
+                    scale[0] = 1;
+                }
+
+                for (var i = 0; i < states; i++)
+                {
+                    alpha[0, i] /= scale[0];
+                }
+
+                for (var t = 1; t < tLen; t++)
+                {
+                    for (var i = 0; i < states; i++)
+                    {
+                        var sum = 0.0;
+                        for (var j = 0; j < states; j++)
+                        {
+                            sum += alpha[t - 1, j] * a[j, i];
+                        }
+
+                        alpha[t, i] = sum * b[i, seq[t]];
+                    }
+
+                    scale[t] = 0;
+                    for (var i = 0; i < states; i++)
+                    {
+                        scale[t] += alpha[t, i];
+                    }
+
+                    if (scale[t] == 0)
+                    {
+                        scale[t] = 1;
+                    }
+
+                    for (var i = 0; i < states; i++)
+                    {
+                        alpha[t, i] /= scale[t];
+                    }
+                }
+
+                for (var i = 0; i < states; i++)
+                {
+                    beta[tLen - 1, i] = 1.0 / scale[tLen - 1];
+                }
+
+                for (var t = tLen - 2; t >= 0; t--)
+                {
+                    for (var i = 0; i < states; i++)
+                    {
+                        var sum = 0.0;
+                        for (var j = 0; j < states; j++)
+                        {
+                            sum += a[i, j] * b[j, seq[t + 1]] * beta[t + 1, j];
+                        }
+
+                        beta[t, i] = sum / scale[t];
+                    }
+                }
+
+                for (var i = 0; i < states; i++)
+                {
+                    var gamma = alpha[0, i] * beta[0, i];
+                    piAcc[i] += gamma;
+                }
+
+                for (var t = 0; t < tLen - 1; t++)
+                {
+                    var denom = 0.0;
+                    for (var i = 0; i < states; i++)
+                    {
+                        for (var j = 0; j < states; j++)
+                        {
+                            denom += alpha[t, i] * a[i, j] * b[j, seq[t + 1]] * beta[t + 1, j];
+                        }
+                    }
+
+                    if (denom == 0)
+                    {
+                        continue;
+                    }
+
+                    for (var i = 0; i < states; i++)
+                    {
+                        var gamma = alpha[t, i] * beta[t, i];
+                        aDen[i] += gamma;
+                        for (var j = 0; j < states; j++)
+                        {
+                            var xi = alpha[t, i] * a[i, j] * b[j, seq[t + 1]] * beta[t + 1, j] / denom;
+                            aAcc[i, j] += xi;
+                        }
+                    }
+                }
+
+                for (var t = 0; t < tLen; t++)
+                {
+                    for (var i = 0; i < states; i++)
+                    {
+                        var gamma = alpha[t, i] * beta[t, i];
+                        bAcc[i, seq[t]] += gamma;
+                    }
+                }
+            }
+
+            for (var i = 0; i < states; i++)
+            {
+                pi[i] = piAcc[i] + pseudo;
+            }
+
+            Normalize(pi);
+
+            for (var i = 0; i < states; i++)
+            {
+                var denom = aDen[i] + pseudo * states;
+                for (var j = 0; j < states; j++)
+                {
+                    a[i, j] = (aAcc[i, j] + pseudo) / denom;
+                }
+            }
+
+            for (var i = 0; i < states; i++)
+            {
+                var denom = 0.0;
+                for (var k = 0; k < symbols; k++)
+                {
+                    denom += bAcc[i, k] + pseudo;
+                }
+
+                if (denom == 0)
+                {
+                    denom = 1;
+                }
+
+                for (var k = 0; k < symbols; k++)
+                {
+                    b[i, k] = (bAcc[i, k] + pseudo) / denom;
+                }
+            }
+        }
+
+        return new HmmModel(pi, a, b);
+    }
+
+    private static HmmModel TrainHmm(IReadOnlyList<int[]> sequences, int states, int symbols, int iterations)
+    {
+        var pi = new double[states];
+        var a = new double[states, states];
+        var b = new double[states, symbols];
+
+        var pseudo = 1e-3;
+        for (var i = 0; i < states; i++)
+        {
+            pi[i] = pseudo;
+            for (var j = 0; j < states; j++)
+            {
+                a[i, j] = pseudo;
+            }
+
+            for (var k = 0; k < symbols; k++)
+            {
+                b[i, k] = pseudo;
+            }
+        }
+
+        foreach (var seq in sequences)
+        {
+            if (seq.Length == 0)
+            {
+                continue;
+            }
+
+            var s0 = seq[0] % states;
+            pi[s0] += 1;
+            b[s0, seq[0]] += 1;
+
+            for (var t = 1; t < seq.Length; t++)
+            {
+                var sPrev = seq[t - 1] % states;
+                var s = seq[t] % states;
+                a[sPrev, s] += 1;
+                b[s, seq[t]] += 1;
+            }
+        }
+
+        Normalize(pi);
+        NormalizeRows(a);
+        NormalizeRows(b);
+
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            var piAcc = new double[states];
+            var aAcc = new double[states, states];
+            var aDen = new double[states];
+            var bAcc = new double[states, symbols];
+
+            foreach (var seq in sequences)
+            {
+                if (seq.Length == 0)
+                {
+                    continue;
+                }
+
+                var tLen = seq.Length;
+                var alpha = new double[tLen, states];
+                var beta = new double[tLen, states];
+                var scale = new double[tLen];
+
+                for (var i = 0; i < states; i++)
+                {
+                    alpha[0, i] = pi[i] * b[i, seq[0]];
+                }
+
+                scale[0] = 0;
+                for (var i = 0; i < states; i++)
+                {
+                    scale[0] += alpha[0, i];
+                }
+
+                if (scale[0] == 0)
+                {
+                    scale[0] = 1;
+                }
+
+                for (var i = 0; i < states; i++)
+                {
+                    alpha[0, i] /= scale[0];
+                }
+
+                for (var t = 1; t < tLen; t++)
+                {
+                    for (var i = 0; i < states; i++)
+                    {
+                        var sum = 0.0;
+                        for (var j = 0; j < states; j++)
+                        {
+                            sum += alpha[t - 1, j] * a[j, i];
+                        }
+
+                        alpha[t, i] = sum * b[i, seq[t]];
+                    }
+
+                    scale[t] = 0;
+                    for (var i = 0; i < states; i++)
+                    {
+                        scale[t] += alpha[t, i];
+                    }
+
+                    if (scale[t] == 0)
+                    {
+                        scale[t] = 1;
+                    }
+
+                    for (var i = 0; i < states; i++)
+                    {
+                        alpha[t, i] /= scale[t];
+                    }
+                }
+
+                for (var i = 0; i < states; i++)
+                {
+                    beta[tLen - 1, i] = 1.0 / scale[tLen - 1];
+                }
+
+                for (var t = tLen - 2; t >= 0; t--)
+                {
+                    for (var i = 0; i < states; i++)
+                    {
+                        var sum = 0.0;
+                        for (var j = 0; j < states; j++)
+                        {
+                            sum += a[i, j] * b[j, seq[t + 1]] * beta[t + 1, j];
+                        }
+
+                        beta[t, i] = sum / scale[t];
+                    }
+                }
+
+                for (var i = 0; i < states; i++)
+                {
+                    var gamma = alpha[0, i] * beta[0, i];
+                    piAcc[i] += gamma;
+                }
+
+                for (var t = 0; t < tLen - 1; t++)
+                {
+                    var denom = 0.0;
+                    for (var i = 0; i < states; i++)
+                    {
+                        for (var j = 0; j < states; j++)
+                        {
+                            denom += alpha[t, i] * a[i, j] * b[j, seq[t + 1]] * beta[t + 1, j];
+                        }
+                    }
+
+                    if (denom == 0)
+                    {
+                        continue;
+                    }
+
+                    for (var i = 0; i < states; i++)
+                    {
+                        var gamma = alpha[t, i] * beta[t, i];
+                        aDen[i] += gamma;
+                        for (var j = 0; j < states; j++)
+                        {
+                            var xi = alpha[t, i] * a[i, j] * b[j, seq[t + 1]] * beta[t + 1, j] / denom;
+                            aAcc[i, j] += xi;
+                        }
+                    }
+                }
+
+                for (var t = 0; t < tLen; t++)
+                {
+                    for (var i = 0; i < states; i++)
+                    {
+                        var gamma = alpha[t, i] * beta[t, i];
+                        bAcc[i, seq[t]] += gamma;
+                    }
+                }
+            }
+
+            for (var i = 0; i < states; i++)
+            {
+                pi[i] = piAcc[i] + pseudo;
+            }
+
+            Normalize(pi);
+
+            for (var i = 0; i < states; i++)
+            {
+                var denom = aDen[i] + pseudo * states;
+                for (var j = 0; j < states; j++)
+                {
+                    a[i, j] = (aAcc[i, j] + pseudo) / denom;
+                }
+            }
+
+            for (var i = 0; i < states; i++)
+            {
+                var denom = 0.0;
+                for (var k = 0; k < symbols; k++)
+                {
+                    denom += bAcc[i, k] + pseudo;
+                }
+
+                if (denom == 0)
+                {
+                    denom = 1;
+                }
+
+                for (var k = 0; k < symbols; k++)
+                {
+                    b[i, k] = (bAcc[i, k] + pseudo) / denom;
+                }
+            }
+        }
+
+        return new HmmModel(pi, a, b);
+    }
+
+    private static double ComputeHmmLogLikelihood(HmmModel model, IReadOnlyList<int[]> sequences)
+    {
+        var logLik = 0.0;
+        var states = model.Pi.Length;
+
+        foreach (var seq in sequences)
+        {
+            if (seq.Length == 0)
+            {
+                continue;
+            }
+
+            var alpha = new double[states];
+            var scale = new double[seq.Length];
+
+            for (var i = 0; i < states; i++)
+            {
+                alpha[i] = model.Pi[i] * model.B[i, seq[0]];
+            }
+
+            scale[0] = alpha.Sum();
+            if (scale[0] == 0)
+            {
+                scale[0] = 1;
+            }
+
+            for (var i = 0; i < states; i++)
+            {
+                alpha[i] /= scale[0];
+            }
+
+            for (var t = 1; t < seq.Length; t++)
+            {
+                var next = new double[states];
+                for (var i = 0; i < states; i++)
+                {
+                    var sum = 0.0;
+                    for (var j = 0; j < states; j++)
+                    {
+                        sum += alpha[j] * model.A[j, i];
+                    }
+
+                    next[i] = sum * model.B[i, seq[t]];
+                }
+
+                var scaleT = next.Sum();
+                if (scaleT == 0)
+                {
+                    scaleT = 1;
+                }
+
+                scale[t] = scaleT;
+                for (var i = 0; i < states; i++)
+                {
+                    next[i] /= scaleT;
+                }
+
+                alpha = next;
+            }
+
+            logLik += scale.Sum(s => Math.Log(s));
+        }
+
+        return logLik;
+    }
+
+    private static double ComputeUnigramLogLikelihood(IReadOnlyList<int[]> sequences, int symbols)
+    {
+        var counts = new double[symbols];
+        var total = 0.0;
+        foreach (var seq in sequences)
+        {
+            foreach (var value in seq)
+            {
+                counts[value] += 1;
+                total += 1;
+            }
+        }
+
+        var logLik = 0.0;
+        for (var i = 0; i < counts.Length; i++)
+        {
+            counts[i] = counts[i] / total;
+        }
+
+        foreach (var seq in sequences)
+        {
+            foreach (var value in seq)
+            {
+                var p = counts[value];
+                logLik += Math.Log(p);
+            }
+        }
+
+        return logLik;
+    }
+
+    private static void Normalize(double[] values)
+    {
+        var sum = values.Sum();
+        if (sum == 0)
+        {
+            return;
+        }
+
+        for (var i = 0; i < values.Length; i++)
+        {
+            values[i] /= sum;
+        }
+    }
+
+    private static void NormalizeRows(double[,] matrix)
+    {
+        var rows = matrix.GetLength(0);
+        var cols = matrix.GetLength(1);
+        for (var i = 0; i < rows; i++)
+        {
+            var sum = 0.0;
+            for (var j = 0; j < cols; j++)
+            {
+                sum += matrix[i, j];
+            }
+
+            if (sum == 0)
+            {
+                continue;
+            }
+
+            for (var j = 0; j < cols; j++)
+            {
+                matrix[i, j] /= sum;
+            }
+        }
+    }
+
+    private static Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2), int> BuildStatefulMappingWithPrev2Early(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment,
+        int maxIndexExclusive)
+    {
+        var counts = new Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2), Dictionary<int, int>>();
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        if (index >= maxIndexExclusive)
+                        {
+                            continue;
+                        }
+
+                        var prev1 = index > 0 ? east[index - 1] : (int?)null;
+                        var prev2 = index > 1 ? east[index - 2] : (int?)null;
+                        var key = (index, step.ValueA.Value, prev1, prev2);
+                        if (!counts.TryGetValue(key, out var map))
+                        {
+                            map = new Dictionary<int, int>();
+                            counts[key] = map;
+                        }
+
+                        var valueB = step.ValueB.Value;
+                        map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                for (var i = 0; i < len && i < maxIndexExclusive; i++)
+                {
+                    var prev1 = i > 0 ? east[i - 1] : (int?)null;
+                    var prev2 = i > 1 ? east[i - 2] : (int?)null;
+                    var key = (i, east[i], prev1, prev2);
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var valueB = west[i];
+                    map[valueB] = map.TryGetValue(valueB, out var existing) ? existing + 1 : 1;
+                }
+            }
+        }
+
+        var mapping = new Dictionary<(int Index, int EastValue, int? Prev1, int? Prev2), int>();
+        foreach (var (key, map) in counts)
+        {
+            var bestValue = int.MaxValue;
+            var bestCount = -1;
+            foreach (var (value, count) in map)
+            {
+                if (count > bestCount || (count == bestCount && value < bestValue))
+                {
+                    bestCount = count;
+                    bestValue = value;
+                }
+            }
+
+            mapping[key] = bestValue;
+        }
+
+        return mapping;
+    }
+
+    private static EarlyDecodeStats EvaluateStatefulDecodePrev2Early(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment,
+        int maxIndexExclusive)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithPrev2Early(sequences, training, useAlignment, maxIndexExclusive);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        if (index >= maxIndexExclusive)
+                        {
+                            continue;
+                        }
+
+                        totalAligned++;
+                        var prev1 = index > 0 ? east[index - 1] : (int?)null;
+                        var prev2 = index > 1 ? east[index - 2] : (int?)null;
+                        var key = (index, step.ValueA.Value, prev1, prev2);
+                        if (mapping.TryGetValue(key, out var predicted))
+                        {
+                            totalCovered++;
+                            if (predicted == step.ValueB.Value)
+                            {
+                                totalCorrect++;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                var limit = Math.Min(len, maxIndexExclusive);
+                totalAligned += limit;
+                for (var i = 0; i < limit; i++)
+                {
+                    var prev1 = i > 0 ? east[i - 1] : (int?)null;
+                    var prev2 = i > 1 ? east[i - 2] : (int?)null;
+                    var key = (i, east[i], prev1, prev2);
+                    if (mapping.TryGetValue(key, out var predicted))
+                    {
+                        totalCovered++;
+                        if (predicted == west[i])
+                        {
+                            totalCorrect++;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new EarlyDecodeStats(usedPairs, totalAligned, totalCovered, totalCorrect);
+    }
+
+    private static EarlyDecodeBaselineStats EvaluateStatefulDecodePrev1EarlyWithBaseline(
+        Dictionary<int, int[]> sequences,
+        IReadOnlyList<(int EastId, int WestId)> pairs,
+        bool useAlignment,
+        int maxIndexExclusive,
+        int samples,
+        int seed)
+    {
+        var totalAligned = 0;
+        var totalCovered = 0;
+        var totalCorrect = 0;
+        var usedPairs = 0;
+        var baselineCorrectTotal = 0.0;
+        var rng = new Random(seed);
+
+        foreach (var (eastId, westId) in pairs)
+        {
+            var training = pairs.Where(p => p != (eastId, westId)).ToList();
+            var mapping = BuildStatefulMappingWithRunPosition(sequences, training, useAlignment);
+
+            if (!sequences.TryGetValue(eastId, out var east) || !sequences.TryGetValue(westId, out var west))
+            {
+                continue;
+            }
+
+            if (east.Length == 0 || west.Length == 0)
+            {
+                continue;
+            }
+
+            usedPairs++;
+
+            var alignedSteps = new List<(int Index, int EastValue, int WestValue, int? PrevEast)>();
+
+            if (useAlignment)
+            {
+                var alignment = SequenceAlignment.Align(east, west);
+                foreach (var step in alignment.Steps)
+                {
+                    if (step.ValueA.HasValue && step.ValueB.HasValue && step.IndexA.HasValue)
+                    {
+                        var index = step.IndexA.Value;
+                        if (index >= maxIndexExclusive)
+                        {
+                            continue;
+                        }
+
+                        totalAligned++;
+                        var prevEast = index > 0 ? east[index - 1] : (int?)null;
+                        alignedSteps.Add((index, step.ValueA.Value, step.ValueB.Value, prevEast));
+                    }
+                }
+            }
+            else
+            {
+                var len = Math.Min(east.Length, west.Length);
+                var limit = Math.Min(len, maxIndexExclusive);
+                totalAligned += limit;
+                for (var i = 0; i < limit; i++)
+                {
+                    var prevEast = i > 0 ? east[i - 1] : (int?)null;
+                    alignedSteps.Add((i, east[i], west[i], prevEast));
+                }
+            }
+
+            foreach (var step in alignedSteps)
+            {
+                var key = (step.Index, step.EastValue, step.PrevEast);
+                if (mapping.TryGetValue(key, out var predicted))
+                {
+                    totalCovered++;
+                    if (predicted == step.WestValue)
+                    {
+                        totalCorrect++;
+                    }
+                }
+            }
+
+            if (alignedSteps.Count == 0 || samples <= 0)
+            {
+                continue;
+            }
+
+            var westValues = alignedSteps.Select(s => s.WestValue).ToArray();
+            var baselineCorrect = 0.0;
+            for (var s = 0; s < samples; s++)
+            {
+                var shuffled = Shuffle(westValues, rng);
+                var correct = 0;
+                for (var i = 0; i < alignedSteps.Count; i++)
+                {
+                    var step = alignedSteps[i];
+                    var key = (step.Index, step.EastValue, step.PrevEast);
+                    if (mapping.TryGetValue(key, out var predicted) && predicted == shuffled[i])
+                    {
+                        correct++;
+                    }
+                }
+
+                baselineCorrect += correct;
+            }
+
+            baselineCorrectTotal += baselineCorrect / samples;
+        }
+
+        var baselineMean = usedPairs == 0 ? 0.0 : baselineCorrectTotal;
+        return new EarlyDecodeBaselineStats(usedPairs, totalAligned, totalCovered, totalCorrect, baselineMean);
     }
 
     private static char GetHeaderMotifType(EyeMessage message)
@@ -4398,6 +13658,277 @@ public static class HypothesisCatalog
         }
 
         return new SmoothedLeaveOneOutStats(order1Correct, order1Total, order2Correct, order2Total, k, lambda2, lambda1, lambda0);
+    }
+
+    private static HashSet<(int Prev2, int Prev1)> BuildSharedOrder2Contexts(
+        IReadOnlyDictionary<int, int[]> sequences,
+        int minMessageCoverage)
+    {
+        var coverage = new Dictionary<(int Prev2, int Prev1), HashSet<int>>();
+        foreach (var (id, sequence) in sequences)
+        {
+            for (var i = 2; i < sequence.Length; i++)
+            {
+                var key = (sequence[i - 2], sequence[i - 1]);
+                if (!coverage.TryGetValue(key, out var ids))
+                {
+                    ids = new HashSet<int>();
+                    coverage[key] = ids;
+                }
+
+                ids.Add(id);
+            }
+        }
+
+        return coverage
+            .Where(kvp => kvp.Value.Count >= minMessageCoverage)
+            .Select(kvp => kvp.Key)
+            .ToHashSet();
+    }
+
+    private static SharedContextCoverageStats ComputeSharedContextCoverage(
+        IReadOnlyDictionary<int, int[]> sequences,
+        IReadOnlySet<(int Prev2, int Prev1)> sharedContexts)
+    {
+        var totalPositions = 0;
+        var sharedPositions = 0;
+
+        foreach (var sequence in sequences.Values)
+        {
+            for (var i = 2; i < sequence.Length; i++)
+            {
+                totalPositions++;
+                var key = (sequence[i - 2], sequence[i - 1]);
+                if (sharedContexts.Contains(key))
+                {
+                    sharedPositions++;
+                }
+            }
+        }
+
+        var coverageRate = totalPositions == 0 ? 0 : Math.Round(sharedPositions / (double)totalPositions, 3);
+        return new SharedContextCoverageStats(coverageRate, sharedPositions, totalPositions);
+    }
+
+    private static SharedContextPredictionStats EvaluateSharedContextPrediction(
+        IReadOnlyDictionary<int, int[]> sequences,
+        IReadOnlySet<(int Prev2, int Prev1)> sharedContexts)
+    {
+        var totalCovered = 0;
+        var totalCorrect = 0;
+
+        foreach (var (id, sequence) in sequences)
+        {
+            var training = sequences.Where(kvp => kvp.Key != id).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+            var counts = new Dictionary<(int Prev2, int Prev1), Dictionary<int, int>>();
+
+            foreach (var trainSeq in training.Values)
+            {
+                for (var i = 2; i < trainSeq.Length; i++)
+                {
+                    var key = (trainSeq[i - 2], trainSeq[i - 1]);
+                    if (!sharedContexts.Contains(key))
+                    {
+                        continue;
+                    }
+
+                    if (!counts.TryGetValue(key, out var map))
+                    {
+                        map = new Dictionary<int, int>();
+                        counts[key] = map;
+                    }
+
+                    var next = trainSeq[i];
+                    map[next] = map.TryGetValue(next, out var existing) ? existing + 1 : 1;
+                }
+            }
+
+            var mapping = new Dictionary<(int Prev2, int Prev1), int>();
+            foreach (var (key, map) in counts)
+            {
+                var bestValue = int.MaxValue;
+                var bestCount = -1;
+                foreach (var (value, count) in map)
+                {
+                    if (count > bestCount || (count == bestCount && value < bestValue))
+                    {
+                        bestCount = count;
+                        bestValue = value;
+                    }
+                }
+
+                mapping[key] = bestValue;
+            }
+
+            for (var i = 2; i < sequence.Length; i++)
+            {
+                var key = (sequence[i - 2], sequence[i - 1]);
+                if (!sharedContexts.Contains(key))
+                {
+                    continue;
+                }
+
+                if (mapping.TryGetValue(key, out var predicted))
+                {
+                    totalCovered++;
+                    if (predicted == sequence[i])
+                    {
+                        totalCorrect++;
+                    }
+                }
+            }
+        }
+
+        return new SharedContextPredictionStats(totalCovered, totalCorrect);
+    }
+
+    private static SharedContextEnrichmentStats ComputeSharedContextEnrichment(
+        IReadOnlyDictionary<int, int[]> sequences,
+        IReadOnlySet<(int Prev2, int Prev1)> sharedContexts)
+    {
+        var sharedHeader = 0;
+        var sharedBody = 0;
+        var totalHeader = 0;
+        var totalBody = 0;
+
+        foreach (var (_, sequence) in sequences)
+        {
+            if (!TryGetHeaderEndIndex(sequence, out var headerEnd, out _))
+            {
+                continue;
+            }
+
+            for (var i = 2; i < sequence.Length; i++)
+            {
+                var key = (sequence[i - 2], sequence[i - 1]);
+                var isHeader = i <= headerEnd;
+                if (isHeader)
+                {
+                    totalHeader++;
+                }
+                else
+                {
+                    totalBody++;
+                }
+
+                if (sharedContexts.Contains(key))
+                {
+                    if (isHeader)
+                    {
+                        sharedHeader++;
+                    }
+                    else
+                    {
+                        sharedBody++;
+                    }
+                }
+            }
+        }
+
+        var sharedTotal = sharedHeader + sharedBody;
+        var baselineTotal = totalHeader + totalBody;
+        var sharedHeaderShare = sharedTotal == 0 ? 0 : Math.Round(sharedHeader / (double)sharedTotal, 3);
+        var baselineHeaderShare = baselineTotal == 0 ? 0 : Math.Round(totalHeader / (double)baselineTotal, 3);
+        var enrichmentRatio = baselineHeaderShare == 0 ? 0 : Math.Round(sharedHeaderShare / baselineHeaderShare, 3);
+
+        return new SharedContextEnrichmentStats(sharedHeaderShare, baselineHeaderShare, enrichmentRatio);
+    }
+
+    private static Dictionary<int, string[]> LoadSourceGlyphMessages()
+    {
+        var assembly = typeof(HypothesisTests).Assembly;
+        using var stream = assembly.GetManifestResourceStream("sources.NoitaEyeGlyphMessages.md");
+        string[] lines;
+        if (stream != null)
+        {
+            using var reader = new StreamReader(stream);
+            var content = reader.ReadToEnd();
+            lines = content.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+        }
+        else
+        {
+            var candidates = new List<string>
+            {
+                Path.Combine(AppContext.BaseDirectory, "sources", "Noita Eye Glyph Messages.md"),
+            };
+
+            var root = FindRepoRootContaining("sources");
+            if (root != null)
+            {
+                candidates.Add(Path.Combine(root, "sources", "Noita Eye Glyph Messages.md"));
+            }
+
+            var path = candidates.FirstOrDefault(File.Exists);
+            if (path == null)
+            {
+                return new Dictionary<int, string[]>();
+            }
+
+            lines = File.ReadAllLines(path);
+        }
+        var messageHeader = new Regex(@"^##\s*Message\s+(\d+)", RegexOptions.Compiled);
+        var messages = new Dictionary<int, List<string>>();
+        int? current = null;
+
+        foreach (var raw in lines)
+        {
+            var line = raw.Trim();
+            var match = messageHeader.Match(line);
+            if (match.Success)
+            {
+                current = int.Parse(match.Groups[1].Value);
+                if (!messages.ContainsKey(current.Value))
+                {
+                    messages[current.Value] = new List<string>();
+                }
+
+                continue;
+            }
+
+            if (!current.HasValue)
+            {
+                continue;
+            }
+
+            if (line.StartsWith("## ", StringComparison.Ordinal))
+            {
+                current = null;
+                continue;
+            }
+
+            var compact = new string(line.Where(ch => !char.IsWhiteSpace(ch)).ToArray());
+            if (compact.Length == 0 || !compact.All(char.IsDigit))
+            {
+                continue;
+            }
+
+            var normalized = compact.Replace("5", string.Empty);
+            if (normalized.Length > 0)
+            {
+                messages[current.Value].Add(normalized);
+            }
+        }
+
+        return messages.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.ToArray());
+    }
+
+    private static string? FindRepoRootContaining(string folderName)
+    {
+        foreach (var start in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
+        {
+            var directory = new DirectoryInfo(start);
+            while (directory != null)
+            {
+                if (Directory.Exists(Path.Combine(directory.FullName, folderName)))
+                {
+                    return directory.FullName;
+                }
+
+                directory = directory.Parent;
+            }
+        }
+
+        return null;
     }
 
     private static int ArgMax(Dictionary<int, int> map)
